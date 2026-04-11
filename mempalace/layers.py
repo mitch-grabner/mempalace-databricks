@@ -1,165 +1,139 @@
 #!/usr/bin/env python3
 """
-layers.py — 4-Layer Memory Stack for mempalace
-===================================================
+layers.py — 4-Layer Memory Stack for MemPalace (Databricks-native)
+===================================================================
 
 Load only what you need, when you need it.
 
     Layer 0: Identity       (~100 tokens)   — Always loaded. "Who am I?"
     Layer 1: Essential Story (~500-800)      — Always loaded. Top moments from the palace.
     Layer 2: On-Demand      (~200-500 each)  — Loaded when a topic/wing comes up.
-    Layer 3: Deep Search    (unlimited)      — Full ChromaDB semantic search.
+    Layer 3: Deep Search    (unlimited)      — Full Vector Search semantic search.
 
 Wake-up cost: ~600-900 tokens (L0+L1). Leaves 95%+ of context free.
 
-Reads directly from ChromaDB (mempalace_drawers)
-and ~/.mempalace/identity.txt.
+Reads from:
+  - Config Volume identity.txt  (L0)
+  - Delta table mempalace_drawers  (L1, L2)
+  - Vector Search index  (L3)
 """
 
-import os
+from __future__ import annotations
+
 import sys
-from pathlib import Path
 from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
-import chromadb
+from .config import DatabricksConfig
+from .palace import _get_spark
+from .searcher import _query_vs_index, SearchError
 
-from .config import MempalaceConfig
 
-
-# ---------------------------------------------------------------------------
-# Layer 0 — Identity
-# ---------------------------------------------------------------------------
+# ── Layer 0 — Identity ───────────────────────────────────────────────────────
 
 
 class Layer0:
-    """
-    ~100 tokens. Always loaded.
-    Reads from ~/.mempalace/identity.txt — a plain-text file the user writes.
+    """~100 tokens. Always loaded.
 
-    Example identity.txt:
+    Reads from the config Volume ``identity.txt``.
+
+    Example identity.txt::
+
         I am Atlas, a personal AI assistant for Alice.
         Traits: warm, direct, remembers everything.
         People: Alice (creator), Bob (Alice's partner).
         Project: A journaling app that helps people process emotions.
     """
 
-    def __init__(self, identity_path: str = None):
-        if identity_path is None:
-            identity_path = os.path.expanduser("~/.mempalace/identity.txt")
-        self.path = identity_path
-        self._text = None
+    def __init__(self, config: Optional[DatabricksConfig] = None) -> None:
+        self._config = config or DatabricksConfig()
+        self._text: Optional[str] = None
 
     def render(self) -> str:
         """Return the identity text, or a sensible default."""
         if self._text is not None:
             return self._text
-
-        if os.path.exists(self.path):
-            with open(self.path, "r") as f:
-                self._text = f.read().strip()
-        else:
-            self._text = (
-                "## L0 — IDENTITY\nNo identity configured. Create ~/.mempalace/identity.txt"
-            )
-
+        self._text = self._config.load_identity()
         return self._text
 
     def token_estimate(self) -> int:
+        """Rough token count (~4 chars per token)."""
         return len(self.render()) // 4
 
 
-# ---------------------------------------------------------------------------
-# Layer 1 — Essential Story (auto-generated from palace)
-# ---------------------------------------------------------------------------
+# ── Layer 1 — Essential Story (auto-generated from palace) ───────────────────
 
 
 class Layer1:
-    """
-    ~500-800 tokens. Always loaded.
-    Auto-generated from the highest-weight / most-recent drawers in the palace.
-    Groups by room, picks the top N moments, compresses to a compact summary.
+    """~500-800 tokens. Always loaded.
+
+    Auto-generated from the highest-importance drawers in the Delta table.
+    Groups by room, picks the top N moments, compresses to compact text.
     """
 
-    MAX_DRAWERS = 15  # at most 15 moments in wake-up
-    MAX_CHARS = 3200  # hard cap on total L1 text (~800 tokens)
+    MAX_DRAWERS = 15   # at most 15 moments in wake-up
+    MAX_CHARS = 3200   # hard cap on total L1 text (~800 tokens)
 
-    def __init__(self, palace_path: str = None, wing: str = None):
-        cfg = MempalaceConfig()
-        self.palace_path = palace_path or cfg.palace_path
+    def __init__(
+        self,
+        config: Optional[DatabricksConfig] = None,
+        wing: Optional[str] = None,
+    ) -> None:
+        self._config = config or DatabricksConfig()
         self.wing = wing
 
     def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
+        """Pull top drawers from Delta and format as compact L1 text.
+
+        Returns:
+            A multi-line string suitable for injection into a system prompt.
+        """
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
+            spark = _get_spark()
+        except RuntimeError:
+            return "## L1 — No Spark session. Run from a notebook or job."
+
+        table = self._config.drawers_table
+
+        # Build query — importance DESC, recent first as tiebreaker
+        where = f"WHERE wing = '{self.wing}'" if self.wing else ""
+        query = f"""
+            SELECT text, wing, room, source_file, importance
+            FROM {table}
+            {where}
+            ORDER BY COALESCE(importance, 3.0) DESC, filed_at DESC
+            LIMIT {self.MAX_DRAWERS}
+        """
+
+        try:
+            rows = spark.sql(query).collect()
         except Exception:
-            return "## L1 — No palace found. Run: mempalace mine <dir>"
+            return "## L1 — No palace found. Run the setup notebook, then mine data."
 
-        # Fetch all drawers in batches to avoid SQLite variable limit (~999)
-        _BATCH = 500
-        docs, metas = [], []
-        offset = 0
-        while True:
-            kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
-            if self.wing:
-                kwargs["where"] = {"wing": self.wing}
-            try:
-                batch = col.get(**kwargs)
-            except Exception:
-                break
-            batch_docs = batch.get("documents", [])
-            batch_metas = batch.get("metadatas", [])
-            if not batch_docs:
-                break
-            docs.extend(batch_docs)
-            metas.extend(batch_metas)
-            offset += len(batch_docs)
-            if len(batch_docs) < _BATCH:
-                break
-
-        if not docs:
+        if not rows:
             return "## L1 — No memories yet."
 
-        # Score each drawer: prefer high importance, recent filing
-        scored = []
-        for doc, meta in zip(docs, metas):
-            importance = 3
-            # Try multiple metadata keys that might carry weight info
-            for key in ("importance", "emotional_weight", "weight"):
-                val = meta.get(key)
-                if val is not None:
-                    try:
-                        importance = float(val)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            scored.append((importance, meta, doc))
-
-        # Sort by importance descending, take top N
-        scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[: self.MAX_DRAWERS]
-
         # Group by room for readability
-        by_room = defaultdict(list)
-        for imp, meta, doc in top:
-            room = meta.get("room", "general")
-            by_room[room].append((imp, meta, doc))
+        by_room: Dict[str, list] = defaultdict(list)
+        for row in rows:
+            room = row["room"] or "general"
+            by_room[room].append(row)
 
         # Build compact text
         lines = ["## L1 — ESSENTIAL STORY"]
-
         total_len = 0
+
         for room, entries in sorted(by_room.items()):
             room_line = f"\n[{room}]"
             lines.append(room_line)
             total_len += len(room_line)
 
-            for imp, meta, doc in entries:
-                source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
+            for row in entries:
+                source = Path(row["source_file"] or "").name if row["source_file"] else ""
 
                 # Truncate doc to keep L1 compact
-                snippet = doc.strip().replace("\n", " ")
+                snippet = (row["text"] or "").strip().replace("\n", " ")
                 if len(snippet) > 200:
                     snippet = snippet[:197] + "..."
 
@@ -177,61 +151,74 @@ class Layer1:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Layer 2 — On-Demand (wing/room filtered retrieval)
-# ---------------------------------------------------------------------------
+# ── Layer 2 — On-Demand (wing/room filtered retrieval) ───────────────────────
 
 
 class Layer2:
-    """
-    ~200-500 tokens per retrieval.
+    """~200-500 tokens per retrieval.
+
     Loaded when a specific topic or wing comes up in conversation.
-    Queries ChromaDB with a wing/room filter.
+    Queries the Delta drawers table with a wing/room filter.
     """
 
-    def __init__(self, palace_path: str = None):
-        cfg = MempalaceConfig()
-        self.palace_path = palace_path or cfg.palace_path
+    def __init__(self, config: Optional[DatabricksConfig] = None) -> None:
+        self._config = config or DatabricksConfig()
 
-    def retrieve(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
-        """Retrieve drawers filtered by wing and/or room."""
+    def retrieve(
+        self,
+        wing: Optional[str] = None,
+        room: Optional[str] = None,
+        n_results: int = 10,
+    ) -> str:
+        """Retrieve drawers filtered by wing and/or room.
+
+        Args:
+            wing: Optional wing filter.
+            room: Optional room filter.
+            n_results: Maximum rows to return.
+
+        Returns:
+            Formatted multi-line string of drawer snippets.
+        """
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
-        except Exception:
-            return "No palace found."
+            spark = _get_spark()
+        except RuntimeError:
+            return "No Spark session available."
 
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
+        table = self._config.drawers_table
 
-        kwargs = {"include": ["documents", "metadatas"], "limit": n_results}
-        if where:
-            kwargs["where"] = where
+        # Build WHERE clause
+        conditions: List[str] = []
+        if wing:
+            conditions.append(f"wing = '{wing}'")
+        if room:
+            conditions.append(f"room = '{room}'")
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+
+        query = f"""
+            SELECT text, room, source_file
+            FROM {table}
+            {where}
+            ORDER BY filed_at DESC
+            LIMIT {n_results}
+        """
 
         try:
-            results = col.get(**kwargs)
+            rows = spark.sql(query).collect()
         except Exception as e:
             return f"Retrieval error: {e}"
 
-        docs = results.get("documents", [])
-        metas = results.get("metadatas", [])
-
-        if not docs:
+        if not rows:
             label = f"wing={wing}" if wing else ""
             if room:
                 label += f" room={room}" if label else f"room={room}"
             return f"No drawers found for {label}."
 
-        lines = [f"## L2 — ON-DEMAND ({len(docs)} drawers)"]
-        for doc, meta in zip(docs[:n_results], metas[:n_results]):
-            room_name = meta.get("room", "?")
-            source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
-            snippet = doc.strip().replace("\n", " ")
+        lines = [f"## L2 — ON-DEMAND ({len(rows)} drawers)"]
+        for row in rows:
+            room_name = row["room"] or "?"
+            source = Path(row["source_file"] or "").name if row["source_file"] else ""
+            snippet = (row["text"] or "").strip().replace("\n", " ")
             if len(snippet) > 300:
                 snippet = snippet[:297] + "..."
             entry = f"  [{room_name}] {snippet}"
@@ -242,153 +229,106 @@ class Layer2:
         return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Layer 3 — Deep Search (full semantic search via ChromaDB)
-# ---------------------------------------------------------------------------
+# ── Layer 3 — Deep Search (Vector Search semantic search) ────────────────────
 
 
 class Layer3:
+    """Unlimited depth. Semantic search against the full palace.
+
+    Delegates to ``searcher._query_vs_index`` for the actual VS call.
     """
-    Unlimited depth. Semantic search against the full palace.
-    Reuses searcher.py logic against mempalace_drawers.
-    """
 
-    def __init__(self, palace_path: str = None):
-        cfg = MempalaceConfig()
-        self.palace_path = palace_path or cfg.palace_path
+    def __init__(self, config: Optional[DatabricksConfig] = None) -> None:
+        self._config = config or DatabricksConfig()
 
-    def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
-        """Semantic search, returns compact result text."""
+    def search(
+        self,
+        query: str,
+        wing: Optional[str] = None,
+        room: Optional[str] = None,
+        n_results: int = 5,
+    ) -> str:
+        """Semantic search, returns compact result text.
+
+        Args:
+            query: Natural-language search string.
+            wing: Optional wing filter.
+            room: Optional room filter.
+            n_results: Maximum number of results.
+
+        Returns:
+            Formatted multi-line string of search results.
+        """
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
-        except Exception:
-            return "No palace found."
-
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
-
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
-        try:
-            results = col.query(**kwargs)
-        except Exception as e:
+            hits = _query_vs_index(query, self._config, wing, room, n_results)
+        except SearchError as e:
             return f"Search error: {e}"
 
-        docs = results["documents"][0]
-        metas = results["metadatas"][0]
-        dists = results["distances"][0]
-
-        if not docs:
+        if not hits:
             return "No results found."
 
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
-        for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-            similarity = round(1 - dist, 3)
-            wing_name = meta.get("wing", "?")
-            room_name = meta.get("room", "?")
-            source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
-
-            snippet = doc.strip().replace("\n", " ")
+        for i, hit in enumerate(hits, 1):
+            lines.append(
+                f"  [{i}] {hit['wing']}/{hit['room']} (sim={hit['similarity']})"
+            )
+            snippet = hit["text"].strip().replace("\n", " ")
             if len(snippet) > 300:
                 snippet = snippet[:297] + "..."
-
-            lines.append(f"  [{i}] {wing_name}/{room_name} (sim={similarity})")
             lines.append(f"      {snippet}")
-            if source:
-                lines.append(f"      src: {source}")
+            if hit["source_file"] and hit["source_file"] != "?":
+                lines.append(f"      src: {hit['source_file']}")
 
         return "\n".join(lines)
 
     def search_raw(
-        self, query: str, wing: str = None, room: str = None, n_results: int = 5
-    ) -> list:
-        """Return raw dicts instead of formatted text."""
+        self,
+        query: str,
+        wing: Optional[str] = None,
+        room: Optional[str] = None,
+        n_results: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """Return raw dicts instead of formatted text.
+
+        Args:
+            query: Natural-language search string.
+            wing: Optional wing filter.
+            room: Optional room filter.
+            n_results: Maximum number of results.
+
+        Returns:
+            List of hit dicts (empty list on error).
+        """
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
-        except Exception:
+            return _query_vs_index(query, self._config, wing, room, n_results)
+        except SearchError:
             return []
 
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
 
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
-        try:
-            results = col.query(**kwargs)
-        except Exception:
-            return []
-
-        hits = []
-        for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
-        ):
-            hits.append(
-                {
-                    "text": doc,
-                    "wing": meta.get("wing", "unknown"),
-                    "room": meta.get("room", "unknown"),
-                    "source_file": Path(meta.get("source_file", "?")).name,
-                    "similarity": round(1 - dist, 3),
-                    "metadata": meta,
-                }
-            )
-        return hits
-
-
-# ---------------------------------------------------------------------------
-# MemoryStack — unified interface
-# ---------------------------------------------------------------------------
+# ── MemoryStack — unified interface ──────────────────────────────────────────
 
 
 class MemoryStack:
-    """
-    The full 4-layer stack. One class, one palace, everything works.
+    """The full 4-layer stack. One class, one config, everything works.
+
+    Example::
 
         stack = MemoryStack()
         print(stack.wake_up())                # L0 + L1 (~600-900 tokens)
-        print(stack.recall(wing="my_app"))     # L2 on-demand
-        print(stack.search("pricing change"))  # L3 deep search
+        print(stack.recall(wing="my_app"))    # L2 on-demand
+        print(stack.search("pricing change")) # L3 deep search
     """
 
-    def __init__(self, palace_path: str = None, identity_path: str = None):
-        cfg = MempalaceConfig()
-        self.palace_path = palace_path or cfg.palace_path
-        self.identity_path = identity_path or os.path.expanduser("~/.mempalace/identity.txt")
+    def __init__(self, config: Optional[DatabricksConfig] = None) -> None:
+        self._config = config or DatabricksConfig()
+        self.l0 = Layer0(self._config)
+        self.l1 = Layer1(self._config)
+        self.l2 = Layer2(self._config)
+        self.l3 = Layer3(self._config)
 
-        self.l0 = Layer0(self.identity_path)
-        self.l1 = Layer1(self.palace_path)
-        self.l2 = Layer2(self.palace_path)
-        self.l3 = Layer3(self.palace_path)
+    def wake_up(self, wing: Optional[str] = None) -> str:
+        """Generate wake-up text: L0 (identity) + L1 (essential story).
 
-    def wake_up(self, wing: str = None) -> str:
-        """
-        Generate wake-up text: L0 (identity) + L1 (essential story).
         Typically ~600-900 tokens. Inject into system prompt or first message.
 
         Args:
@@ -407,55 +347,72 @@ class MemoryStack:
 
         return "\n".join(parts)
 
-    def recall(self, wing: str = None, room: str = None, n_results: int = 10) -> str:
+    def recall(
+        self,
+        wing: Optional[str] = None,
+        room: Optional[str] = None,
+        n_results: int = 10,
+    ) -> str:
         """On-demand L2 retrieval filtered by wing/room."""
         return self.l2.retrieve(wing=wing, room=room, n_results=n_results)
 
-    def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
+    def search(
+        self,
+        query: str,
+        wing: Optional[str] = None,
+        room: Optional[str] = None,
+        n_results: int = 5,
+    ) -> str:
         """Deep L3 semantic search."""
         return self.l3.search(query, wing=wing, room=room, n_results=n_results)
 
-    def status(self) -> dict:
+    def status(self) -> Dict[str, Any]:
         """Status of all layers."""
-        result = {
-            "palace_path": self.palace_path,
+        config = self._config
+        identity_path = config._volume_path("identity.txt")
+
+        result: Dict[str, Any] = {
+            "catalog": config.catalog,
+            "schema": config.schema,
+            "drawers_table": config.drawers_table,
+            "vs_index": config.vs_index_name,
             "L0_identity": {
-                "path": self.identity_path,
-                "exists": os.path.exists(self.identity_path),
+                "path": str(identity_path),
+                "exists": identity_path.exists(),
                 "tokens": self.l0.token_estimate(),
             },
             "L1_essential": {
-                "description": "Auto-generated from top palace drawers",
+                "description": "Auto-generated from top palace drawers (Delta)",
             },
             "L2_on_demand": {
-                "description": "Wing/room filtered retrieval",
+                "description": "Wing/room filtered retrieval (Delta)",
             },
             "L3_deep_search": {
-                "description": "Full semantic search via ChromaDB",
+                "description": "Full semantic search via Vector Search",
             },
         }
 
         # Count drawers
         try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
-            count = col.count()
-            result["total_drawers"] = count
+            spark = _get_spark()
+            count_row = spark.sql(
+                f"SELECT COUNT(*) AS cnt FROM {config.drawers_table}"
+            ).collect()[0]
+            result["total_drawers"] = count_row["cnt"]
         except Exception:
             result["total_drawers"] = 0
 
         return result
 
 
-# ---------------------------------------------------------------------------
-# CLI (standalone)
-# ---------------------------------------------------------------------------
+# ── CLI (standalone) ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import json
 
-    def usage():
-        print("layers.py — 4-Layer Memory Stack")
+    def usage() -> None:
+        """Print usage and exit."""
+        print("layers.py — 4-Layer Memory Stack (Databricks-native)")
         print()
         print("Usage:")
         print("  python layers.py wake-up              Show L0 + L1")
@@ -471,8 +428,8 @@ if __name__ == "__main__":
     cmd = sys.argv[1]
 
     # Parse flags
-    flags = {}
-    positional = []
+    flags: Dict[str, str] = {}
+    positional: List[str] = []
     for arg in sys.argv[2:]:
         if arg.startswith("--") and "=" in arg:
             key, val = arg.split("=", 1)
@@ -480,8 +437,7 @@ if __name__ == "__main__":
         elif not arg.startswith("--"):
             positional.append(arg)
 
-    palace_path = flags.get("palace")
-    stack = MemoryStack(palace_path=palace_path)
+    stack = MemoryStack()
 
     if cmd in ("wake-up", "wakeup"):
         wing = flags.get("wing")
