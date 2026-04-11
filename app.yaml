@@ -1,16 +1,17 @@
 # ── MemPalace MCP Server — Databricks App Config ──────────────────────────────
 #
-# Deploy:
-#   databricks apps create mcp-mempalace
-#   databricks sync . "/Users/$USER/mcp-mempalace"
+# Deploy (code already in workspace — no sync needed):
+#
+#   databricks apps create mcp-mempalace --profile dev
 #   databricks apps deploy mcp-mempalace \
-#       --source-code-path "/Workspace/Users/$USER/mcp-mempalace"
+#       --source-code-path "/Workspace/Users/$DB_USER/mempalace-databricks" \
+#       --profile dev
 #
 # The app name MUST start with "mcp-" for AI Playground discoverability.
 
 command:
   - "uvicorn"
-  - "main:app"
+  - "app.main:app"
   - "--host"
   - "0.0.0.0"
   - "--port"
@@ -20,7 +21,7 @@ env:
   - name: MEMPALACE_CATALOG
     value: "scratch"
   - name: MEMPALACE_SCHEMA
-    value: "llm"
+    value: "mitch_grabner"
   - name: MEMPALACE_WAREHOUSE_ID
     valueFrom: mempalace-sql-warehouse
 
@@ -28,6 +29,3 @@ resources:
   - name: mempalace-sql-warehouse
     sql_warehouse:
       permission: CAN_USE
-  - name: mempalace-vs-endpoint
-    serving_endpoint:
-      permission: CAN_QUERY

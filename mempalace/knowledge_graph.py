@@ -8,7 +8,7 @@ Real knowledge graph with:
   - Temporal validity (valid_from → valid_to — knows WHEN facts are true)
   - Closet references (links back to the verbatim memory)
 
-Storage: Delta tables in Unity Catalog (scratch.llm.mempalace_entities / _triples)
+Storage: Delta tables in Unity Catalog (scratch.mitch_grabner.mempalace_entities / _triples)
 Query: entity-first traversal with time filtering via Spark SQL
 
 Usage::

@@ -87,7 +87,7 @@ def sanitize_content(value: str, max_length: int = 100_000) -> str:
 # ── Default constants ─────────────────────────────────────────────────────────
 
 DEFAULT_CATALOG = "scratch"
-DEFAULT_SCHEMA = "llm"
+DEFAULT_SCHEMA = "mitch_grabner"
 DEFAULT_VS_ENDPOINT = "mempalace_vs_endpoint"
 
 DEFAULT_TOPIC_WINGS: List[str] = [

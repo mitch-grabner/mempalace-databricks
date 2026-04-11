@@ -11,7 +11,7 @@
 
 | Phase | Files | Status | Notes |
 | --- | --- | --- | --- |
-| **Phase 1: Foundation** | `config.py`, `palace.py`, setup notebook | **COMPLETE** | All tables, VS endpoint, VS index provisioned and validated in `scratch.llm`. |
+| **Phase 1: Foundation** | `config.py`, `palace.py`, setup notebook | **COMPLETE** | All tables, VS endpoint, VS index provisioned and validated in `scratch.mitch_grabner`. |
 | **Phase 2: Search** | `searcher.py`, `layers.py` | **COMPLETE** | VS hybrid search working. Column-mapping robustness pattern established. |
 | **Phase 3: Knowledge Graph** | `knowledge_graph.py` | **COMPLETE** | SQLite → Spark SQL. All 11 methods preserved. |
 | **Phase 4: Ingest** | `miner.py`, `convo_miner.py` | **COMPLETE** | ChromaDB batch ops → `palace.add_drawers()` MERGE INTO. Stale-file purge via Delta DELETE. |
@@ -39,10 +39,10 @@
 
 | Decision | Choice | Notes |
 | --- | --- | --- |
-| **Catalog + schema** | `scratch.llm` | Dev/test target. Configurable via env vars for promotion. |
+| **Catalog + schema** | `scratch.mitch_grabner` | Dev/test target. Configurable via env vars for promotion. |
 | **Execution context** | Notebook + Job (Spark available) | Primary runtime. No `databricks-sql-connector` needed. |
 | **MCP server** | **Databricks App** | Deployed as an app so any Responses agent can call it via consistent MCP tools. |
-| **Vector Search endpoint** | Create new `mempalace_vs_endpoint` | Dedicated endpoint in `scratch.llm`. |
+| **Vector Search endpoint** | Create new `mempalace_vs_endpoint` | Dedicated endpoint in `scratch.mitch_grabner`. |
 | **Sync mode** | `TRIGGERED` | Manual sync after batch ingest — cheaper, adequate. |
 | **Embedding model** | `databricks-gte-large-en` | Production-grade, zero setup. |
 | **Hybrid search** | Yes (`query_type="hybrid"`) | Keyword + semantic mirrors ChromaDB behavior. |
@@ -55,20 +55,20 @@
 BEFORE (local)                          AFTER (Databricks)
 ─────────────────                       ──────────────────
 ChromaDB PersistentClient        →      Delta table  +  Vector Search Index
-  └─ mempalace_drawers collection       └─ scratch.llm.mempalace_drawers
-                                            + VS index: scratch.llm.mempalace_drawers_index
+  └─ mempalace_drawers collection       └─ scratch.mitch_grabner.mempalace_drawers
+                                            + VS index: scratch.mitch_grabner.mempalace_drawers_index
 
 SQLite knowledge_graph.sqlite3   →      Delta tables
-  ├─ entities table                     ├─ scratch.llm.mempalace_entities
-  └─ triples table                      └─ scratch.llm.mempalace_triples
+  ├─ entities table                     ├─ scratch.mitch_grabner.mempalace_entities
+  └─ triples table                      └─ scratch.mitch_grabner.mempalace_triples
 
 ~/.mempalace/config.json         →      Volume JSON  /Volumes/scratch/llm/mempalace_config/config.json
 ~/.mempalace/identity.txt        →      Volume file  /Volumes/scratch/llm/mempalace_config/identity.txt
 ~/.mempalace/wing_config.json    →      Volume JSON  /Volumes/scratch/llm/mempalace_config/wing_config.json
 ~/.mempalace/people_map.json     →      Volume JSON  /Volumes/scratch/llm/mempalace_config/people_map.json
 
-~/.mempalace/agents/*.json       →      Delta table  scratch.llm.mempalace_diaries
-~/.mempalace/wal/write_log.jsonl →      Delta table  scratch.llm.mempalace_wal  (append-only)
+~/.mempalace/agents/*.json       →      Delta table  scratch.mitch_grabner.mempalace_diaries
+~/.mempalace/wal/write_log.jsonl →      Delta table  scratch.mitch_grabner.mempalace_wal  (append-only)
 ```
 
 ### Why These Choices
@@ -88,7 +88,7 @@ SQLite knowledge_graph.sqlite3   →      Delta tables
 ### 2.1 — Drawers (verbatim text chunks)
 
 ```sql
-CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_drawers (
+CREATE TABLE IF NOT EXISTS scratch.mitch_grabner.mempalace_drawers (
     id              STRING        NOT NULL,   -- deterministic hash: sha256(wing|room|source_file|chunk_index)
     text            STRING        NOT NULL,   -- verbatim content (the "drawer")
     wing            STRING        NOT NULL,   -- person or project
@@ -131,12 +131,12 @@ w.vector_search_endpoints.create(name="mempalace_vs_endpoint")
 
 # Create Delta Sync index with Databricks-managed embeddings
 w.vector_search_indexes.create(
-    name="scratch.llm.mempalace_drawers_index",
+    name="scratch.mitch_grabner.mempalace_drawers_index",
     endpoint_name="mempalace_vs_endpoint",
     primary_key="id",
     index_type=VectorIndexType.DELTA_SYNC,
     delta_sync_vector_index_spec=DeltaSyncVectorIndexSpecRequest(
-        source_table="scratch.llm.mempalace_drawers",
+        source_table="scratch.mitch_grabner.mempalace_drawers",
         embedding_source_columns=[
             EmbeddingSourceColumn(
                 name="text",
@@ -153,7 +153,7 @@ w.vector_search_indexes.create(
 ### 2.3 — Knowledge Graph: Entities
 
 ```sql
-CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_entities (
+CREATE TABLE IF NOT EXISTS scratch.mitch_grabner.mempalace_entities (
     id              STRING        NOT NULL,   -- lowercased, underscored name
     name            STRING        NOT NULL,   -- display name
     type            STRING,                   -- person, project, tool, concept
@@ -167,7 +167,7 @@ USING DELTA;
 ### 2.4 — Knowledge Graph: Triples
 
 ```sql
-CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_triples (
+CREATE TABLE IF NOT EXISTS scratch.mitch_grabner.mempalace_triples (
     id              STRING        NOT NULL,   -- deterministic hash
     subject         STRING        NOT NULL,   -- FK → entities.id
     predicate       STRING        NOT NULL,   -- relationship type
@@ -186,7 +186,7 @@ USING DELTA;
 ### 2.5 — Agent Diaries
 
 ```sql
-CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_diaries (
+CREATE TABLE IF NOT EXISTS scratch.mitch_grabner.mempalace_diaries (
     id              STRING        NOT NULL,
     agent_name      STRING        NOT NULL,
     entry           STRING        NOT NULL,   -- AAAK-encoded diary line
@@ -199,7 +199,7 @@ USING DELTA;
 ### 2.6 — Write-Ahead Log (Audit)
 
 ```sql
-CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_wal (
+CREATE TABLE IF NOT EXISTS scratch.mitch_grabner.mempalace_wal (
     timestamp       STRING        NOT NULL,   -- ISO timestamp
     operation       STRING        NOT NULL,   -- add_drawer, delete_drawer, kg_add, etc.
     params          STRING        NOT NULL,   -- JSON of call params
@@ -212,7 +212,7 @@ USING DELTA;
 ### 2.7 — Volume for Config Files
 
 ```sql
-CREATE VOLUME IF NOT EXISTS scratch.llm.mempalace_config;
+CREATE VOLUME IF NOT EXISTS scratch.mitch_grabner.mempalace_config;
 ```
 
 Files stored inside:
@@ -265,7 +265,7 @@ VS `score` (higher=better) used directly — no `1-dist` conversion.
 | `sqlite3.connect(db_path)` | `_get_spark()` from palace.py |
 | `INSERT OR REPLACE` | `MERGE INTO ... WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` |
 | `INSERT OR IGNORE` | `MERGE INTO ... WHEN NOT MATCHED THEN INSERT` |
-| `UPDATE ... SET valid_to=?` | `UPDATE scratch.llm.mempalace_triples SET valid_to = ? WHERE ...` |
+| `UPDATE ... SET valid_to=?` | `UPDATE scratch.mitch_grabner.mempalace_triples SET valid_to = ? WHERE ...` |
 | `SELECT ... WHERE subject=?` | `spark.sql(f"SELECT ... WHERE subject = '{eid}'")` |
 | `PRAGMA journal_mode=WAL` | N/A — Delta handles natively |
 

@@ -83,7 +83,18 @@ def _get_vsc() -> "VectorSearchClient":
     global _vs_client
     if _vs_client is None:
         from databricks.vector_search.client import VectorSearchClient
-        _vs_client = VectorSearchClient()
+        # VectorSearchClient doesn't auto-discover Databricks App SP
+        # credentials, and older versions lack workspace_client kwarg.
+        # Extract auth from the SDK's WorkspaceClient instead.
+        ws = _get_ws()
+        header_factory = ws.config.authenticate()
+        headers = header_factory() if callable(header_factory) else header_factory
+        token = (headers.get("Authorization") or "").removeprefix("Bearer ")
+        _vs_client = VectorSearchClient(
+            workspace_url=ws.config.host,
+            personal_access_token=token,
+            disable_notice=True,
+        )
     return _vs_client
 
 
