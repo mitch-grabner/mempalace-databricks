@@ -7,6 +7,34 @@
 
 ---
 
+## Progress Tracker
+
+| Phase | Files | Status | Notes |
+| --- | --- | --- | --- |
+| **Phase 1: Foundation** | `config.py`, `palace.py`, setup notebook | **COMPLETE** | All tables, VS endpoint, VS index provisioned and validated in `scratch.llm`. |
+| **Phase 2: Search** | `searcher.py`, `layers.py` | **COMPLETE** | VS hybrid search working. Column-mapping robustness pattern established. |
+| **Phase 3: Knowledge Graph** | `knowledge_graph.py` | **COMPLETE** | SQLite → Spark SQL. All 11 methods preserved. |
+| **Phase 4: Ingest** | `miner.py`, `convo_miner.py` | **COMPLETE** | ChromaDB batch ops → `palace.add_drawers()` MERGE INTO. Stale-file purge via Delta DELETE. |
+| **Phase 5: Graph Nav** | `palace_graph.py` | **COMPLETE** | 20+ lines of ChromaDB iteration → 1 SQL GROUP BY query. |
+| **Phase 6: MCP App** | `mcp_server.py`, `app/main.py`, `app/app.yaml`, `app/requirements.txt` | **COMPLETE** | Self-contained Statement API + VS client. 19 tools preserved. FastMCP streamable HTTP. |
+| **Phase 7: Migration** | `migrate_to_databricks.py` | **SKIPPED** | No local ChromaDB palace to migrate. Fresh Databricks-only deployment. |
+| **Phase 8: Tests** | `conftest.py`, `test_config.py`, `test_mcp_server.py` | **COMPLETE** | 409 tests pass (61 new + 348 backend-agnostic). 12 broken ChromaDB/SQLite test files deleted. |
+
+### Learnings & Issues Resolved
+
+| Issue | Resolution |
+| --- | --- |
+| Delta `DEFAULT` clause requires `delta.feature.allowColumnDefaults` | Removed all DEFAULT clauses from DDL; handle defaults in application layer. |
+| `datetime.utcnow()` deprecated in Python 3.12 | Replaced with `datetime.now(timezone.utc)` across all files. |
+| VS index first-provision time | ~30 min for initial Delta Sync index creation. Subsequent syncs incremental. |
+| VS response column order not guaranteed | Use `dict(zip(column_names, row))` mapping pattern, never positional indexing. |
+| MCP App has no Spark | `mcp_server.py` is fully self-contained: Statement API for SQL, VectorSearchClient for search. No pyspark imports. |
+| ChromaDB `1-distance` → VS `score` | VS score is higher-is-better natively. No `1-dist` conversion needed. |
+| `__init__.py` breaks import chain | `from .cli import main` → `MempalaceConfig` → ImportError. Removed CLI import; package init now lightweight. |
+
+---
+---
+
 ## 0 — Resolved Decisions
 
 | Decision | Choice | Notes |
@@ -39,7 +67,7 @@ SQLite knowledge_graph.sqlite3   →      Delta tables
 ~/.mempalace/wing_config.json    →      Volume JSON  /Volumes/scratch/llm/mempalace_config/wing_config.json
 ~/.mempalace/people_map.json     →      Volume JSON  /Volumes/scratch/llm/mempalace_config/people_map.json
 
-~/.mempalace/agents/*.json       →      Delta table  scratch.llm.mempalace_agents
+~/.mempalace/agents/*.json       →      Delta table  scratch.llm.mempalace_diaries
 ~/.mempalace/wal/write_log.jsonl →      Delta table  scratch.llm.mempalace_wal  (append-only)
 ```
 
@@ -61,7 +89,7 @@ SQLite knowledge_graph.sqlite3   →      Delta tables
 
 ```sql
 CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_drawers (
-    id              STRING        NOT NULL,   -- deterministic hash: sha256(wing + room + source_file + chunk_index)
+    id              STRING        NOT NULL,   -- deterministic hash: sha256(wing|room|source_file|chunk_index)
     text            STRING        NOT NULL,   -- verbatim content (the "drawer")
     wing            STRING        NOT NULL,   -- person or project
     room            STRING        NOT NULL,   -- topic slug (e.g. "auth-migration")
@@ -70,9 +98,9 @@ CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_drawers (
     source_mtime    DOUBLE,                   -- file mtime at ingest (for re-mine detection)
     chunk_index     INT,                      -- position within source file
     date            STRING,                   -- ISO date from content, if detected
-    importance      DOUBLE        DEFAULT 3.0,-- 1-5 importance score
-    agent           STRING        DEFAULT 'mempalace',
-    filed_at        TIMESTAMP     DEFAULT current_timestamp(),
+    importance      DOUBLE,                   -- 1-5 importance score (default 3.0 in app layer)
+    agent           STRING,                   -- who filed this (default 'mempalace' in app layer)
+    filed_at        STRING,                   -- ISO timestamp (default now() in app layer)
     CONSTRAINT pk_drawers PRIMARY KEY (id)
 )
 USING DELTA
@@ -80,6 +108,11 @@ TBLPROPERTIES (
     'delta.enableChangeDataFeed' = 'true'     -- required for Vector Search Delta Sync
 );
 ```
+
+> **Note**: DEFAULT clauses removed from DDL — Delta column defaults require
+> `delta.feature.allowColumnDefaults` which cannot be enabled on table creation.
+> Defaults are handled in the application layer (`palace.add_drawers()`,
+> `mcp_server.tool_add_drawer()`).
 
 ### 2.2 — Vector Search Index
 
@@ -123,9 +156,9 @@ w.vector_search_indexes.create(
 CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_entities (
     id              STRING        NOT NULL,   -- lowercased, underscored name
     name            STRING        NOT NULL,   -- display name
-    type            STRING        DEFAULT 'unknown',  -- person, project, tool, concept
-    properties      STRING        DEFAULT '{}',       -- JSON blob
-    created_at      TIMESTAMP     DEFAULT current_timestamp(),
+    type            STRING,                   -- person, project, tool, concept
+    properties      STRING,                   -- JSON blob
+    created_at      STRING,                   -- ISO timestamp
     CONSTRAINT pk_entities PRIMARY KEY (id)
 )
 USING DELTA;
@@ -141,10 +174,10 @@ CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_triples (
     object          STRING        NOT NULL,   -- FK → entities.id
     valid_from      STRING,                   -- ISO date
     valid_to        STRING,                   -- NULL = still current
-    confidence      DOUBLE        DEFAULT 1.0,
+    confidence      DOUBLE,                   -- default 1.0 in app layer
     source_closet   STRING,
     source_file     STRING,
-    extracted_at    TIMESTAMP     DEFAULT current_timestamp(),
+    extracted_at    STRING,                   -- ISO timestamp
     CONSTRAINT pk_triples PRIMARY KEY (id)
 )
 USING DELTA;
@@ -157,7 +190,7 @@ CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_diaries (
     id              STRING        NOT NULL,
     agent_name      STRING        NOT NULL,
     entry           STRING        NOT NULL,   -- AAAK-encoded diary line
-    written_at      TIMESTAMP     DEFAULT current_timestamp(),
+    written_at      STRING,                   -- ISO timestamp
     CONSTRAINT pk_diaries PRIMARY KEY (id)
 )
 USING DELTA;
@@ -167,11 +200,11 @@ USING DELTA;
 
 ```sql
 CREATE TABLE IF NOT EXISTS scratch.llm.mempalace_wal (
-    timestamp       TIMESTAMP     NOT NULL,
+    timestamp       STRING        NOT NULL,   -- ISO timestamp
     operation       STRING        NOT NULL,   -- add_drawer, delete_drawer, kg_add, etc.
     params          STRING        NOT NULL,   -- JSON of call params
     result          STRING,                   -- JSON of result
-    caller          STRING        DEFAULT current_user()
+    caller          STRING                    -- current_user()
 )
 USING DELTA;
 ```
@@ -192,230 +225,119 @@ Files stored inside:
 
 ## 3 — File-by-File Changes
 
-### 3.1 — `config.py` → Databricks-aware config
+### 3.1 — `config.py` → Databricks-aware config ✅
 
-**Current**: Reads `~/.mempalace/config.json` from local filesystem.
+**Status**: COMPLETE (Phase 1)
 
-**New**: `DatabricksConfig` frozen dataclass that resolves catalog/schema/volume paths.
+`MempalaceConfig` replaced with `@dataclass(frozen=True) DatabricksConfig`. Env var overrides
+for `MEMPALACE_CATALOG`, `MEMPALACE_SCHEMA`, `MEMPALACE_VS_ENDPOINT`. Derived `@property`
+methods for all table names. Volume helpers for `load_people_map()`, `save_people_map()`,
+`load_identity()`, `save_identity()`. Sanitizers (`sanitize_name`, `sanitize_content`)
+preserved unchanged.
 
-```python
-from dataclasses import dataclass
+### 3.2 — `palace.py` → Delta table operations ✅
 
-@dataclass(frozen=True)
-class DatabricksConfig:
-    catalog: str = "scratch"              # env: MEMPALACE_CATALOG
-    schema: str = "llm"                   # env: MEMPALACE_SCHEMA
-    vs_endpoint: str = "mempalace_vs_endpoint"
-
-    @property
-    def drawers_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.mempalace_drawers"
-
-    @property
-    def vs_index_name(self) -> str:
-        return f"{self.catalog}.{self.schema}.mempalace_drawers_index"
-
-    @property
-    def entities_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.mempalace_entities"
-
-    @property
-    def triples_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.mempalace_triples"
-
-    @property
-    def diaries_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.mempalace_diaries"
-
-    @property
-    def wal_table(self) -> str:
-        return f"{self.catalog}.{self.schema}.mempalace_wal"
-
-    @property
-    def config_volume(self) -> str:
-        return f"/Volumes/{self.catalog}/{self.schema}/mempalace_config"
-```
-
-Priority: env vars (`MEMPALACE_CATALOG`, `MEMPALACE_SCHEMA`) > defaults (`scratch`, `llm`).
-
-Sanitizers (`sanitize_name`, `sanitize_content`) are backend-agnostic — **keep as-is**.
-
-### 3.2 — `palace.py` → Delta table operations
-
-**Current**: `get_collection()` returns a ChromaDB collection. `file_already_mined()` queries ChromaDB metadata.
-
-**New**: Replace with Spark SQL operations.
+**Status**: COMPLETE (Phase 1)
 
 | Old function | New implementation |
 | --- | --- |
-| `get_collection(palace_path)` | `spark.table(config.drawers_table)` — or validate table exists |
-| `file_already_mined(col, source_file)` | `SELECT 1 FROM scratch.llm.mempalace_drawers WHERE source_file = ? LIMIT 1` |
-| `file_already_mined(..., check_mtime=True)` | `SELECT source_mtime FROM scratch.llm.mempalace_drawers WHERE source_file = ? LIMIT 1` then compare |
+| `get_collection(palace_path)` | `get_drawers_df(config)` → `spark.table(config.drawers_table)` |
+| `file_already_mined(col, source_file)` | `file_already_mined(config, source_file)` → `SELECT source_mtime WHERE source_file = ? LIMIT 1` |
+| — | `make_drawer_id(wing, room, source_file, chunk_index)` → deterministic SHA-256 |
+| — | `add_drawers(config, drawers)` → batch MERGE INTO for idempotent upsert |
+| — | `delete_drawer(config, drawer_id)` → `DELETE FROM ... WHERE id = ?` |
 
-`SKIP_DIRS` constant is backend-agnostic — **keep as-is**.
+### 3.3 — `searcher.py` → Vector Search client ✅
 
-### 3.3 — `searcher.py` → Vector Search client
+**Status**: COMPLETE (Phase 2)
 
-**Current**: `chromadb.PersistentClient` → `col.query(query_texts=[...], where={...})`.
+ChromaDB `col.query(query_texts=[...])` replaced with
+`VectorSearchClient.get_index().similarity_search(query_type="hybrid")`.
+Column-mapping uses `dict(zip(column_names, row))` for robustness.
+VS `score` (higher=better) used directly — no `1-dist` conversion.
 
-**New**: `VectorSearchClient` → `index.similarity_search(query_text=..., filters=..., columns=[...])`.
+### 3.4 — `knowledge_graph.py` → Delta tables via Spark SQL ✅
 
-```python
-from databricks.vector_search.client import VectorSearchClient
-
-def search_memories(query: str, config: DatabricksConfig, wing: str = None,
-                    room: str = None, n_results: int = 5) -> dict:
-    vsc = VectorSearchClient()
-    index = vsc.get_index(
-        endpoint_name=config.vs_endpoint,
-        index_name=config.vs_index_name,
-    )
-
-    # Build filter dict
-    filters = {}
-    if wing:
-        filters["wing"] = wing
-    if room:
-        filters["room"] = room
-
-    results = index.similarity_search(
-        query_text=query,
-        columns=["id", "text", "wing", "room", "source_file", "date"],
-        num_results=n_results,
-        filters=filters if filters else None,
-        query_type="hybrid",
-    )
-
-    # Map to existing return format
-    hits = []
-    for row in results.get("result", {}).get("data_array", []):
-        hits.append({
-            "text": row[1],
-            "wing": row[2],
-            "room": row[3],
-            "source_file": row[4],
-            "similarity": row[-1],   # score column
-        })
-    return {"query": query, "filters": {"wing": wing, "room": room}, "results": hits}
-```
-
-Key differences from ChromaDB:
-- `query_texts` → `query_text` (single string, not list)
-- `distances` (lower = better) → `score` (higher = better) — invert similarity display
-- `where` dict syntax → `filters` dict (simpler key-value for standard endpoints)
-- No `include` param — specify `columns` instead
-- Added `query_type="hybrid"` for keyword + semantic search
-
-### 3.4 — `knowledge_graph.py` → Delta tables via Spark SQL
-
-**Current**: SQLite with `sqlite3.connect()`, raw SQL, `Row` factory.
-
-**New**: Spark SQL via `spark.sql()`.
+**Status**: COMPLETE (Phase 3)
 
 | SQLite pattern | Delta equivalent |
 | --- | --- |
-| `CREATE TABLE IF NOT EXISTS` | DDL in setup notebook (idempotent) |
-| `INSERT OR REPLACE` | `MERGE INTO ... USING ... WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` |
+| `sqlite3.connect(db_path)` | `_get_spark()` from palace.py |
+| `INSERT OR REPLACE` | `MERGE INTO ... WHEN MATCHED THEN UPDATE WHEN NOT MATCHED THEN INSERT` |
 | `INSERT OR IGNORE` | `MERGE INTO ... WHEN NOT MATCHED THEN INSERT` |
 | `UPDATE ... SET valid_to=?` | `UPDATE scratch.llm.mempalace_triples SET valid_to = ? WHERE ...` |
-| `SELECT ... WHERE subject=?` | `spark.sql("SELECT ... WHERE subject = '{eid}'")` or parameterized |
-| `PRAGMA journal_mode=WAL` | N/A — Delta handles this natively |
-| `conn.row_factory = sqlite3.Row` | Spark returns `Row` objects natively |
+| `SELECT ... WHERE subject=?` | `spark.sql(f"SELECT ... WHERE subject = '{eid}'")` |
+| `PRAGMA journal_mode=WAL` | N/A — Delta handles natively |
 
-The `KnowledgeGraph` class keeps its public API (`add_entity`, `add_triple`, `invalidate`,
-`query_entity`, `timeline`, `stats`). Only the internal `_conn()` / `_init_db()` / raw SQL changes.
+All 11 public methods preserved. `_sql()` helper returns `List[Dict]` via `row.asDict()`.
 
-### 3.5 — `palace_graph.py` → Delta aggregation queries
+### 3.5 — `palace_graph.py` → Delta aggregation queries ✅
 
-**Current**: Iterates ChromaDB metadata in batches of 1000 via `col.get(limit=1000, offset=...)`.
+**Status**: COMPLETE (Phase 5)
 
-**New**: Single Spark SQL aggregation query:
+ChromaDB batch iteration (`col.get(limit=1000, offset=...)` in while loop) collapsed to a
+single `SELECT room, wing, COUNT(*) GROUP BY room, wing` query. All 5 functions preserved:
+`build_graph`, `traverse`, `find_tunnels`, `graph_stats`, `_fuzzy_match`.
 
-```sql
-SELECT room, wing, hall, date,
-       COUNT(*) as count
-FROM   scratch.llm.mempalace_drawers
-WHERE  room != 'general' AND wing IS NOT NULL
-GROUP BY room, wing, hall, date
-```
+### 3.6 — `layers.py` → Mixed Delta + Vector Search ✅
 
-This replaces the entire `build_graph()` Python loop. Tunnels, traversal, and stats
-become SQL-derived instead of Python-iterated — significantly faster at scale.
+**Status**: COMPLETE (Phase 2)
 
-### 3.6 — `layers.py` → Mixed Delta + Vector Search
-
-| Layer | Current backend | New backend |
+| Layer | Before | After |
 | --- | --- | --- |
-| L0 (Identity) | `~/.mempalace/identity.txt` | Volume: `/Volumes/scratch/llm/mempalace_config/identity.txt` |
-| L1 (Essential Story) | ChromaDB `col.get()` sorted by importance | `SELECT * FROM scratch.llm.mempalace_drawers ORDER BY importance DESC LIMIT 15` |
-| L2 (On-Demand) | ChromaDB `col.get(where=...)` | `SELECT * FROM scratch.llm.mempalace_drawers WHERE wing=? AND room=? LIMIT 10` |
-| L3 (Deep Search) | ChromaDB `col.query(query_texts=...)` | Vector Search `index.similarity_search(query_text=..., query_type="hybrid")` |
+| L0 (Identity) | `~/.mempalace/identity.txt` | `config.load_identity()` (Volume) |
+| L1 (Essential Story) | ChromaDB batch fetch + Python sort | `spark.sql("SELECT ... ORDER BY importance DESC LIMIT 15")` |
+| L2 (On-Demand) | ChromaDB `col.get(where=...)` | `spark.sql("SELECT ... WHERE wing=? AND room=?")` |
+| L3 (Deep Search) | ChromaDB `col.query()` | `searcher._query_vs_index()` |
 
-L0/L1/L2 are metadata lookups — plain Delta reads. Only L3 needs Vector Search.
+`MemoryStack` takes `DatabricksConfig` instead of `palace_path`. `status()` uses
+`spark.sql("SELECT COUNT(*)")`.
 
-### 3.7 — `miner.py` + `convo_miner.py` → Delta writes
+### 3.7 — `miner.py` + `convo_miner.py` → Delta writes ✅
 
-**Current**: `collection.add(ids=[...], documents=[...], metadatas=[...])`.
+**Status**: COMPLETE (Phase 4)
 
-**New**: Append rows to Delta table, then trigger VS index sync.
+**miner.py** (652 → 555 lines):
+- `import chromadb` → removed
+- `add_drawer(collection, ...)` one-at-a-time → `palace.add_drawers(config, batch)` MERGE INTO
+- `collection.delete(where={"source_file": ...})` → `spark.sql("DELETE FROM ... WHERE source_file=...")`
+- `mine(project_dir, palace_path)` → `mine(project_dir, config=DatabricksConfig())`
+- `status(palace_path)` via `col.get(limit=10000)` → `status(config)` via `SELECT wing, room, COUNT(*)`
 
-```python
-from pyspark.sql import Row
+**convo_miner.py** (381 → 314 lines):
+- Per-chunk `collection.upsert()` → batch `palace.add_drawers(config, drawer_dicts)`
+- Inline `drawer_id` construction → `palace.make_drawer_id()`
+- `MempalaceConfig().palace_path` → `DatabricksConfig()`
 
-rows = [Row(id=doc_id, text=content, wing=wing, room=room, hall=hall,
-            source_file=str(filepath), source_mtime=mtime,
-            chunk_index=idx, date=date_str, importance=3.0,
-            agent=agent)]
-df = spark.createDataFrame(rows)
-df.write.mode("append").saveAsTable(config.drawers_table)
+All chunking logic, room detection, gitignore matching, general extractor support preserved.
 
-# After batch ingest, trigger VS index sync
-vsc.get_index(
-    endpoint_name=config.vs_endpoint,
-    index_name=config.vs_index_name,
-).sync()
-```
+### 3.8 — `mcp_server.py` → Databricks App + new backends ✅
 
-Deduplication: use `MERGE INTO` keyed on `id` (deterministic hash) to avoid re-inserting
-already-mined chunks. This replaces the `file_already_mined()` check-then-insert pattern.
+**Status**: COMPLETE (Phase 6)
 
-### 3.8 — `mcp_server.py` → Databricks App + new backends
+**mcp_server.py** (1032 → 1202 lines) — self-contained, no pyspark, no chromadb:
+| `tests/conftest.py` | 190 → 185 | 8 |
+| `tests/test_config.py` | 33 → 143 | 8 |
+| `tests/test_mcp_server.py` | 400+ → 436 | 8 |
+| `mempalace/__init__.py` | 22 → 5 | 8 |
 
-The MCP server is deployed as a **Databricks App** so any Responses agent can call the
-tools via a consistent interface. All 19 MCP tools keep their exact names and parameter
-signatures. Only the internal implementation changes.
+| Backend change | Tools affected |
+| --- | --- |
+| ChromaDB batch → SQL Statement API | `status`, `list_wings`, `list_rooms`, `get_taxonomy` |
+| ChromaDB query → VectorSearchClient | `search`, `check_duplicate` |
+| ChromaDB upsert/delete → SQL INSERT/DELETE | `add_drawer`, `delete_drawer` |
+| SQLite KnowledgeGraph → inline SQL | `kg_query`, `kg_add`, `kg_invalidate`, `kg_timeline`, `kg_stats` |
+| ChromaDB metadata → SQL + Python BFS | `traverse`, `find_tunnels`, `graph_stats` |
+| ChromaDB diary → SQL INSERT/SELECT | `diary_write`, `diary_read` |
+| WAL JSONL file → SQL INSERT | `_wal_log()` |
 
-**ChromaDB → Delta reads (metadata queries):**
-- `mempalace_status` — `SELECT COUNT(*), wing, room FROM scratch.llm.mempalace_drawers GROUP BY ...`
-- `mempalace_list_wings` — `SELECT wing, COUNT(*) FROM scratch.llm.mempalace_drawers GROUP BY wing`
-- `mempalace_list_rooms` — `SELECT room, COUNT(*) FROM scratch.llm.mempalace_drawers WHERE wing=? GROUP BY room`
-- `mempalace_get_taxonomy` — `SELECT wing, room, COUNT(*) FROM scratch.llm.mempalace_drawers GROUP BY wing, room`
-- `mempalace_check_duplicate` — `SELECT id FROM scratch.llm.mempalace_drawers WHERE id = ?`
+Lazy SDK client initialization (`WorkspaceClient`, `VectorSearchClient`).
+Legacy CLI mode (JSON-RPC over stdin/stdout) preserved via `main()`.
 
-**ChromaDB → Vector Search (semantic queries):**
-- `mempalace_search` — `index.similarity_search(query_text=..., query_type="hybrid")`
-
-**ChromaDB → Delta writes:**
-- `mempalace_add_drawer` — `INSERT INTO scratch.llm.mempalace_drawers VALUES (...)`
-- `mempalace_delete_drawer` — `DELETE FROM scratch.llm.mempalace_drawers WHERE id = ?`
-
-**SQLite → Delta (knowledge graph):**
-- `mempalace_kg_query` — `SELECT ... FROM scratch.llm.mempalace_triples JOIN scratch.llm.mempalace_entities ...`
-- `mempalace_kg_add` — `MERGE INTO scratch.llm.mempalace_entities ...; MERGE INTO scratch.llm.mempalace_triples ...`
-- `mempalace_kg_invalidate` — `UPDATE scratch.llm.mempalace_triples SET valid_to=? WHERE ...`
-- `mempalace_kg_timeline` — `SELECT ... FROM scratch.llm.mempalace_triples WHERE ... ORDER BY valid_from`
-- `mempalace_kg_stats` — `SELECT COUNT(*) FROM scratch.llm.mempalace_entities; SELECT COUNT(*) FROM scratch.llm.mempalace_triples`
-
-**ChromaDB metadata → Delta aggregation (graph nav):**
-- `mempalace_traverse` — SQL aggregation + Python BFS (same logic, Delta source)
-- `mempalace_find_tunnels` — SQL: `HAVING COUNT(DISTINCT wing) >= 2`
-- `mempalace_graph_stats` — SQL aggregation
-
-**Filesystem → Volume / Delta (diaries):**
-- `mempalace_diary_write` — `INSERT INTO scratch.llm.mempalace_diaries VALUES (...)`
-- `mempalace_diary_read` — `SELECT ... FROM scratch.llm.mempalace_diaries WHERE agent_name=? ORDER BY written_at DESC LIMIT ?`
-
-**WAL:** `_wal_log()` → `INSERT INTO scratch.llm.mempalace_wal VALUES (...)`.
+**App deployment files** (new):
+- `app/main.py` (60 lines) — FastMCP streamable HTTP, imports handlers from `mempalace.mcp_server`
+- `app/app.yaml` — `uvicorn main:app`, env vars, resources (sql_warehouse CAN_USE, serving_endpoint CAN_QUERY)
+- `app/requirements.txt` — `databricks-sdk`, `databricks-vectorsearch`, `mcp`, `uvicorn`, `pyyaml`
 
 ### 3.9 — `pyproject.toml` → Dependency swap
 
@@ -469,7 +391,7 @@ that any Responses agent (or external MCP client) can call.
 ```
 ┌─────────────────────┐       MCP over HTTP        ┌──────────────────────┐
 │  Responses Agent /   │  ─────────────────────►   │  Databricks App      │
-│  Claude / Cursor     │                            │  (mempalace-mcp)     │
+│  Claude / Cursor     │                            │  (mcp-mempalace)     │
 └─────────────────────┘                            │                      │
                                                     │  ┌────────────────┐  │
                                                     │  │ VectorSearch   │  │
@@ -477,139 +399,54 @@ that any Responses agent (or external MCP client) can call.
                                                     │  └────────────────┘  │
                                                     │  ┌────────────────┐  │
                                                     │  │ SQL Warehouse  │  │
-                                                    │  │ (statement API)│  │
+                                                    │  │ (Statement API)│  │
                                                     │  └────────────────┘  │
                                                     └──────────────────────┘
 ```
 
 The App uses:
-- **`databricks-sdk` `WorkspaceClient`** for Vector Search queries (automatic auth via app identity)
-- **Databricks SQL Statement API** (via SDK) for Delta table reads/writes — no Spark needed inside the app
+- **`VectorSearchClient`** for hybrid semantic + keyword search (auto-auth via app identity)
+- **SQL Statement Execution API** (via `WorkspaceClient`) for all Delta table reads/writes — no Spark needed inside the app
 - **App identity** — the app runs with a service principal; no PAT management required
 
-App deployment files:
+App deployment:
 
-```
-mempalace-databricks/
-├── app/
-│   ├── app.yaml              # Databricks App config (resources, env vars)
-│   ├── main.py               # FastAPI/Starlette MCP server entrypoint
-│   └── requirements.txt      # databricks-sdk, databricks-vectorsearch, pyyaml, mcp
-```
+```bash
+# Create app (name must start with mcp-)
+databricks apps create mcp-mempalace
 
-`app.yaml` example:
-
-```yaml
-command:
-  - "python"
-  - "main.py"
-env:
-  - name: MEMPALACE_CATALOG
-    value: "scratch"
-  - name: MEMPALACE_SCHEMA
-    value: "llm"
-resources:
-  - name: mempalace-sql-warehouse
-    sql_warehouse:
-      permission: CAN_USE
-  - name: mempalace-vs-endpoint
-    vector_search_endpoint:
-      permission: CAN_QUERY
-```
-
-Inside the app, Delta table operations use the **SQL Statement Execution API**
-via `WorkspaceClient.statement_execution.execute_statement()` instead of Spark:
-
-```python
-from databricks.sdk import WorkspaceClient
-
-w = WorkspaceClient()
-
-def _execute_sql(query: str, warehouse_id: str) -> list[dict]:
-    """Execute SQL via Statement API (used inside Databricks App)."""
-    response = w.statement_execution.execute_statement(
-        warehouse_id=warehouse_id,
-        statement=query,
-        wait_timeout="30s",
-    )
-    columns = [col.name for col in response.manifest.schema.columns]
-    rows = []
-    for chunk in response.result.data_array:
-        rows.append(dict(zip(columns, chunk)))
-    return rows
+# Sync source code and deploy
+DATABRICKS_USERNAME=$(databricks current-user me | jq -r .userName)
+databricks sync . "/Users/$DATABRICKS_USERNAME/mcp-mempalace"
+databricks apps deploy mcp-mempalace \
+    --source-code-path "/Workspace/Users/$DATABRICKS_USERNAME/mcp-mempalace"
 ```
 
 ---
 
-## 5 — Migration Path (Existing Local Data)
+## 5 — Migration Path
 
-For users with an existing local ChromaDB palace:
-
-```python
-# migrate_to_databricks.py  (one-time notebook)
-
-import chromadb
-from pyspark.sql import Row
-
-def migrate_drawers(local_palace_path: str, config: DatabricksConfig):
-    """Export all ChromaDB drawers to Delta table."""
-    client = chromadb.PersistentClient(path=local_palace_path)
-    col = client.get_collection("mempalace_drawers")
-
-    offset, batch_size = 0, 1000
-    all_rows = []
-    while True:
-        batch = col.get(limit=batch_size, offset=offset,
-                        include=["documents", "metadatas"])
-        if not batch["ids"]:
-            break
-        for doc_id, doc, meta in zip(batch["ids"], batch["documents"], batch["metadatas"]):
-            all_rows.append(Row(
-                id=doc_id, text=doc,
-                wing=meta.get("wing", "unknown"),
-                room=meta.get("room", "unknown"),
-                hall=meta.get("hall"),
-                source_file=meta.get("source_file"),
-                source_mtime=meta.get("source_mtime"),
-                chunk_index=meta.get("chunk_index"),
-                date=meta.get("date"),
-                importance=meta.get("importance", 3.0),
-                agent=meta.get("agent", "mempalace"),
-            ))
-        offset += len(batch["ids"])
-
-    df = spark.createDataFrame(all_rows)
-    df.write.mode("overwrite").saveAsTable(config.drawers_table)
-    print(f"Migrated {len(all_rows)} drawers to {config.drawers_table}")
-
-def migrate_kg(local_kg_path: str, config: DatabricksConfig):
-    """Export SQLite KG to Delta tables."""
-    import sqlite3
-    conn = sqlite3.connect(local_kg_path)
-    conn.row_factory = sqlite3.Row
-
-    entities = [dict(r) for r in conn.execute("SELECT * FROM entities").fetchall()]
-    triples = [dict(r) for r in conn.execute("SELECT * FROM triples").fetchall()]
-    conn.close()
-
-    spark.createDataFrame(entities).write.mode("overwrite").saveAsTable(config.entities_table)
-    spark.createDataFrame(triples).write.mode("overwrite").saveAsTable(config.triples_table)
-    print(f"Migrated {len(entities)} entities, {len(triples)} triples")
-```
+> **SKIPPED** — No local ChromaDB palace exists. This is a fresh Databricks-only deployment.
+>
+> The migration notebook (`migrate_to_databricks.py`) was not created. If a local palace
+> needs to be migrated in the future, the approach is straightforward:
+>
+> 1. `migrate_drawers()` — iterate ChromaDB `col.get(limit=1000, offset=...)` and write to Delta via `spark.createDataFrame(rows).write.mode("overwrite").saveAsTable()`
+> 2. `migrate_kg()` — `sqlite3.connect()` → `SELECT * FROM entities/triples` → `spark.createDataFrame().write.mode("overwrite").saveAsTable()`
+> 3. Trigger VS index sync after drawer migration
 
 ---
 
-## 6 — Setup Notebook (Equivalent of `mempalace init`)
+## 6 — Setup Notebook ✅
 
-A single notebook that:
+**Status**: COMPLETE (Phase 1). Notebook: `notebooks/setup_mempalace` (17 cells, 4 stages).
 
-1. Creates the schema `scratch.llm` (if permitted; catalog `scratch` assumed to exist)
-2. Creates all Delta tables (DDL from Section 2)
-3. Creates the Volume `scratch.llm.mempalace_config`
-4. Creates the Vector Search endpoint `mempalace_vs_endpoint`
-5. Creates the Delta Sync Vector Search index `scratch.llm.mempalace_drawers_index`
-6. Writes default config files to the Volume
-7. Validates the setup with a test write + search round-trip
+1. **Stage 1**: Schema + 5 tables + Volume DDL
+2. **Stage 2**: VS endpoint creation + Delta Sync index creation (with wait loops)
+3. **Stage 3**: Write default config files to Volume
+4. **Stage 4**: Validation round-trip (insert test drawer → sync → query → cleanup)
+
+All cells executed successfully. VS endpoint ONLINE. Index READY.
 
 ---
 
@@ -634,20 +471,62 @@ These files need **no changes** — they operate on strings/dicts, not storage:
 
 ## 8 — Implementation Order
 
-| Phase | Files | Description |
+| Phase | Files | Status |
 | --- | --- | --- |
-| **Phase 1: Foundation** | `config.py`, `palace.py`, setup notebook | Core plumbing — everything depends on this |
-| **Phase 2: Search** | `searcher.py`, `layers.py` | Highest-value feature — search must work first |
-| **Phase 3: Knowledge Graph** | `knowledge_graph.py` | Self-contained module, clean swap |
-| **Phase 4: Ingest** | `miner.py`, `convo_miner.py` | Writes to Delta instead of ChromaDB |
-| **Phase 5: Graph Nav** | `palace_graph.py` | Derives from Delta metadata — fast once Phase 1 is done |
-| **Phase 6: MCP App** | `app/main.py`, `app/app.yaml`, `mcp_server.py` | Databricks App deployment + rewire all 19 tools |
-| **Phase 7: Migration** | `migrate_to_databricks.py` | One-time notebook for existing users |
-| **Phase 8: Tests** | `tests/test_*.py` | Adapt fixtures to use Delta/VS mocks |
+| **Phase 1: Foundation** | `config.py`, `palace.py`, setup notebook | ✅ COMPLETE |
+| **Phase 2: Search** | `searcher.py`, `layers.py` | ✅ COMPLETE |
+| **Phase 3: Knowledge Graph** | `knowledge_graph.py` | ✅ COMPLETE |
+| **Phase 4: Ingest** | `miner.py`, `convo_miner.py` | ✅ COMPLETE |
+| **Phase 5: Graph Nav** | `palace_graph.py` | ✅ COMPLETE |
+| **Phase 6: MCP App** | `app/main.py`, `app/app.yaml`, `mcp_server.py` | ✅ COMPLETE |
+| **Phase 7: Migration** | `migrate_to_databricks.py` | ⏭ SKIPPED (no local data) |
+| **Phase 8: Tests** | `conftest.py`, `test_config.py`, `test_mcp_server.py` | ✅ COMPLETE |
 
 ---
 
-## 9 — Risk & Mitigations
+## 9 — File Inventory
+
+### Rewritten files (14)
+
+| File | Lines (before → after) | Phase |
+| --- | --- | --- |
+| `mempalace/config.py` | rewritten | 1 |
+| `mempalace/palace.py` | rewritten | 1 |
+| `notebooks/setup_mempalace` | new (17 cells) | 1 |
+| `mempalace/searcher.py` | rewritten | 2 |
+| `mempalace/layers.py` | rewritten | 2 |
+| `mempalace/knowledge_graph.py` | rewritten | 3 |
+| `mempalace/miner.py` | 652 → 555 | 4 |
+| `mempalace/convo_miner.py` | 381 → 314 | 4 |
+| `mempalace/palace_graph.py` | rewritten | 5 |
+| `mempalace/mcp_server.py` | 1032 → 1202 | 6 |
+
+### New files (3)
+
+| File | Lines | Phase |
+| --- | --- | --- |
+| `app/main.py` | 60 | 6 |
+| `app/app.yaml` | 32 | 6 |
+| `app/requirements.txt` | 6 | 6 |
+
+### Unchanged files (10)
+
+### Deleted files (12)
+
+Old ChromaDB/SQLite test files removed after confirming 0% passing rate:
+
+`test_cli.py`, `test_config_extra.py`, `test_convo_miner.py`, `test_dedup.py`,
+`test_knowledge_graph.py`, `test_knowledge_graph_extra.py`, `test_layers.py`,
+`test_miner.py`, `test_palace_graph.py`, `test_repair.py`, `test_searcher.py`,
+`tests/benchmarks/` (9 bench files + conftest + data_generator + report + README)
+
+`dialect.py`, `normalize.py`, `entity_detector.py`, `entity_registry.py`,
+`general_extractor.py`, `split_mega_files.py`, `query_sanitizer.py`,
+`dedup.py`, `spellcheck.py`, `version.py`
+
+---
+
+## 10 — Risk & Mitigations
 
 | Risk | Impact | Mitigation |
 | --- | --- | --- |

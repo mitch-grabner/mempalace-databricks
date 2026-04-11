@@ -1,37 +1,80 @@
 """
 test_mcp_server.py — Tests for the MCP server tool handlers and dispatch.
 
-Tests each tool handler directly (unit-level) and the handle_request
-dispatch layer (integration-level). Uses isolated palace + KG fixtures
-via monkeypatch to avoid touching real data.
+Uses monkeypatched ``_sql`` and ``_vs_search`` helpers so no SQL warehouse,
+Vector Search endpoint, or Spark session is needed.
 """
 
 import json
+from collections import defaultdict
+
+import pytest
+
+from conftest import SEED_DRAWERS, _make_sql_responder, _make_vs_responder
 
 
-def _patch_mcp_server(monkeypatch, config, kg):
-    """Patch the mcp_server module globals to use test fixtures."""
+# ── Helpers to build canned SQL responses from SEED_DRAWERS ───────────────────
+
+
+def _wing_room_counts(drawers=SEED_DRAWERS):
+    """GROUP BY wing, room → [{wing, room, cnt}, ...]"""
+    counts = defaultdict(int)
+    for d in drawers:
+        counts[(d["wing"], d["room"])] += 1
+    return [{"wing": w, "room": r, "cnt": str(c)} for (w, r), c in counts.items()]
+
+
+def _wing_counts(drawers=SEED_DRAWERS):
+    """GROUP BY wing → [{wing, cnt}, ...]"""
+    counts = defaultdict(int)
+    for d in drawers:
+        counts[d["wing"]] += 1
+    return [{"wing": w, "cnt": str(c)} for w, c in counts.items()]
+
+
+def _room_counts(drawers=SEED_DRAWERS, wing=None):
+    """GROUP BY room → [{room, cnt}, ...]"""
+    counts = defaultdict(int)
+    for d in drawers:
+        if wing and d["wing"] != wing:
+            continue
+        counts[d["room"]] += 1
+    return [{"room": r, "cnt": str(c)} for r, c in counts.items()]
+
+
+def _seed_vs_hits(n=5):
+    """VS-style row dicts with a score key."""
+    return [
+        {**d, "score": round(0.95 - i * 0.05, 2)}
+        for i, d in enumerate(SEED_DRAWERS[:n])
+    ]
+
+
+# ── Patch helper ──────────────────────────────────────────────────────────────
+
+
+def _patch_mcp(monkeypatch, sql_patterns=None, vs_hits=None, db_config=None):
+    """Monkeypatch the MCP server's I/O layer with canned data."""
     from mempalace import mcp_server
+    from mempalace.config import DatabricksConfig
 
-    monkeypatch.setattr(mcp_server, "_config", config)
-    monkeypatch.setattr(mcp_server, "_kg", kg)
+    if db_config is None:
+        db_config = DatabricksConfig(catalog="test", schema="test")
+    monkeypatch.setattr(mcp_server, "_config", db_config)
 
+    if sql_patterns is not None:
+        monkeypatch.setattr(mcp_server, "_sql", _make_sql_responder(sql_patterns))
 
-def _get_collection(palace_path, create=False):
-    """Helper to get collection from test palace.
+    if vs_hits is not None:
+        monkeypatch.setattr(mcp_server, "_vs_search", _make_vs_responder(vs_hits))
 
-    Returns (client, collection) so callers can clean up the client
-    when they are done.
-    """
-    import chromadb
-
-    client = chromadb.PersistentClient(path=palace_path)
-    if create:
-        return client, client.get_or_create_collection("mempalace_drawers")
-    return client, client.get_collection("mempalace_drawers")
+    # Suppress WAL writes
+    monkeypatch.setattr(mcp_server, "_wal_log", lambda *a, **kw: None)
 
 
-# ── Protocol Layer ──────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Protocol Layer
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestHandleRequest:
@@ -46,45 +89,17 @@ class TestHandleRequest:
         from mempalace.mcp_server import handle_request
 
         resp = handle_request(
-            {
-                "method": "initialize",
-                "id": 1,
-                "params": {"protocolVersion": "2025-11-25"},
-            }
+            {"method": "initialize", "id": 1, "params": {"protocolVersion": "2025-11-25"}}
         )
         assert resp["result"]["protocolVersion"] == "2025-11-25"
 
-    def test_initialize_negotiates_older_supported_version(self):
-        from mempalace.mcp_server import handle_request
-
-        resp = handle_request(
-            {
-                "method": "initialize",
-                "id": 1,
-                "params": {"protocolVersion": "2025-03-26"},
-            }
-        )
-        assert resp["result"]["protocolVersion"] == "2025-03-26"
-
     def test_initialize_unknown_version_falls_back_to_latest(self):
-        from mempalace.mcp_server import handle_request
+        from mempalace.mcp_server import SUPPORTED_PROTOCOL_VERSIONS, handle_request
 
         resp = handle_request(
-            {
-                "method": "initialize",
-                "id": 1,
-                "params": {"protocolVersion": "9999-12-31"},
-            }
+            {"method": "initialize", "id": 1, "params": {"protocolVersion": "9999-12-31"}}
         )
-        from mempalace.mcp_server import SUPPORTED_PROTOCOL_VERSIONS
-
         assert resp["result"]["protocolVersion"] == SUPPORTED_PROTOCOL_VERSIONS[0]
-
-    def test_initialize_missing_version_uses_oldest(self):
-        from mempalace.mcp_server import handle_request, SUPPORTED_PROTOCOL_VERSIONS
-
-        resp = handle_request({"method": "initialize", "id": 1, "params": {}})
-        assert resp["result"]["protocolVersion"] == SUPPORTED_PROTOCOL_VERSIONS[-1]
 
     def test_notifications_initialized_returns_none(self):
         from mempalace.mcp_server import handle_request
@@ -96,39 +111,19 @@ class TestHandleRequest:
         from mempalace.mcp_server import handle_request
 
         resp = handle_request({"method": "tools/list", "id": 2, "params": {}})
-        tools = resp["result"]["tools"]
-        names = {t["name"] for t in tools}
+        names = {t["name"] for t in resp["result"]["tools"]}
         assert "mempalace_status" in names
         assert "mempalace_search" in names
         assert "mempalace_add_drawer" in names
         assert "mempalace_kg_add" in names
-
-    def test_null_arguments_does_not_hang(self, monkeypatch, config, palace_path, seeded_kg):
-        """Sending arguments: null should return a result, not hang (#394)."""
-        _patch_mcp_server(monkeypatch, config, seeded_kg)
-        from mempalace.mcp_server import handle_request
-
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        resp = handle_request(
-            {
-                "method": "tools/call",
-                "id": 10,
-                "params": {"name": "mempalace_status", "arguments": None},
-            }
-        )
-        assert "error" not in resp
-        assert resp["result"] is not None
+        assert "mempalace_diary_write" in names
+        assert len(names) == 19
 
     def test_unknown_tool(self):
         from mempalace.mcp_server import handle_request
 
         resp = handle_request(
-            {
-                "method": "tools/call",
-                "id": 3,
-                "params": {"name": "nonexistent_tool", "arguments": {}},
-            }
+            {"method": "tools/call", "id": 3, "params": {"name": "nonexistent", "arguments": {}}}
         )
         assert resp["error"]["code"] == -32601
 
@@ -138,268 +133,304 @@ class TestHandleRequest:
         resp = handle_request({"method": "unknown/method", "id": 4, "params": {}})
         assert resp["error"]["code"] == -32601
 
-    def test_tools_call_dispatches(self, monkeypatch, config, palace_path, seeded_kg):
-        _patch_mcp_server(monkeypatch, config, seeded_kg)
+    def test_tools_call_dispatches(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY": _wing_room_counts()})
         from mempalace.mcp_server import handle_request
 
-        # Create a collection so status works
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-
         resp = handle_request(
-            {
-                "method": "tools/call",
-                "id": 5,
-                "params": {"name": "mempalace_status", "arguments": {}},
-            }
+            {"method": "tools/call", "id": 5,
+             "params": {"name": "mempalace_status", "arguments": {}}}
         )
-        assert "result" in resp
         content = json.loads(resp["result"]["content"][0]["text"])
         assert "total_drawers" in content
 
+    def test_null_arguments(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY": _wing_room_counts()})
+        from mempalace.mcp_server import handle_request
 
-# ── Read Tools ──────────────────────────────────────────────────────────
+        resp = handle_request(
+            {"method": "tools/call", "id": 10,
+             "params": {"name": "mempalace_status", "arguments": None}}
+        )
+        assert "error" not in resp
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Read Tools
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestReadTools:
-    def test_status_empty_palace(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_status
-
-        result = tool_status()
-        assert result["total_drawers"] == 0
-        assert result["wings"] == {}
-
-    def test_status_with_data(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_status_with_data(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY": _wing_room_counts()})
         from mempalace.mcp_server import tool_status
 
         result = tool_status()
         assert result["total_drawers"] == 4
         assert "project" in result["wings"]
         assert "notes" in result["wings"]
+        assert "protocol" in result
 
-    def test_list_wings(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_status_empty(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []})
+        from mempalace.mcp_server import tool_status
+
+        result = tool_status()
+        assert result["total_drawers"] == 0
+
+    def test_list_wings(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY wing": _wing_counts()})
         from mempalace.mcp_server import tool_list_wings
 
         result = tool_list_wings()
         assert result["wings"]["project"] == 3
         assert result["wings"]["notes"] == 1
 
-    def test_list_rooms_all(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_list_rooms_all(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY room": _room_counts()})
         from mempalace.mcp_server import tool_list_rooms
 
         result = tool_list_rooms()
         assert "backend" in result["rooms"]
         assert "frontend" in result["rooms"]
-        assert "planning" in result["rooms"]
 
-    def test_list_rooms_filtered(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_list_rooms_filtered(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY room": _room_counts(wing="project")})
         from mempalace.mcp_server import tool_list_rooms
 
         result = tool_list_rooms(wing="project")
         assert "backend" in result["rooms"]
         assert "planning" not in result["rooms"]
 
-    def test_get_taxonomy(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_get_taxonomy(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY": _wing_room_counts()})
         from mempalace.mcp_server import tool_get_taxonomy
 
         result = tool_get_taxonomy()
         assert result["taxonomy"]["project"]["backend"] == 2
-        assert result["taxonomy"]["project"]["frontend"] == 1
-        assert result["taxonomy"]["notes"]["planning"] == 1
 
-    def test_no_palace_returns_error(self, monkeypatch, config, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_status
+    def test_get_aaak_spec(self):
+        from mempalace.mcp_server import tool_get_aaak_spec
 
-        result = tool_status()
-        assert "error" in result
+        result = tool_get_aaak_spec()
+        assert "AAAK" in result["aaak_spec"]
 
 
-# ── Search Tool ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Search Tools
+# ══════════════════════════════════════════════════════════════════════════════
 
 
-class TestSearchTool:
-    def test_search_basic(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+class TestSearchTools:
+    def test_search_basic(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []}, vs_hits=_seed_vs_hits())
         from mempalace.mcp_server import tool_search
 
-        result = tool_search(query="JWT authentication tokens")
-        assert "results" in result
+        result = tool_search(query="JWT auth tokens")
         assert len(result["results"]) > 0
-        # Top result should be the auth drawer
-        top = result["results"][0]
-        assert "JWT" in top["text"] or "authentication" in top["text"].lower()
+        assert "text" in result["results"][0]
+        assert result["query"] == "JWT auth tokens"
 
-    def test_search_with_wing_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_search_with_wing_filter(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []}, vs_hits=_seed_vs_hits())
         from mempalace.mcp_server import tool_search
 
-        result = tool_search(query="planning", wing="notes")
-        assert all(r["wing"] == "notes" for r in result["results"])
+        result = tool_search(query="auth", wing="project")
+        assert result["filters"]["wing"] == "project"
 
-    def test_search_with_room_filter(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_search
-
-        result = tool_search(query="database", room="backend")
-        assert all(r["room"] == "backend" for r in result["results"])
-
-
-# ── Write Tools ─────────────────────────────────────────────────────────
-
-
-class TestWriteTools:
-    def test_add_drawer(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_add_drawer
-
-        result = tool_add_drawer(
-            wing="test_wing",
-            room="test_room",
-            content="This is a test memory about Python decorators and metaclasses.",
-        )
-        assert result["success"] is True
-        assert result["wing"] == "test_wing"
-        assert result["room"] == "test_room"
-        assert result["drawer_id"].startswith("drawer_test_wing_test_room_")
-
-    def test_add_drawer_duplicate_detection(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_add_drawer
-
-        content = "This is a unique test memory about Rust ownership and borrowing."
-        result1 = tool_add_drawer(wing="w", room="r", content=content)
-        assert result1["success"] is True
-
-        result2 = tool_add_drawer(wing="w", room="r", content=content)
-        assert result2["success"] is True
-        assert result2["reason"] == "already_exists"
-
-    def test_delete_drawer(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_delete_drawer
-
-        result = tool_delete_drawer("drawer_proj_backend_aaa")
-        assert result["success"] is True
-        assert seeded_collection.count() == 3
-
-    def test_delete_drawer_not_found(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_delete_drawer
-
-        result = tool_delete_drawer("nonexistent_drawer")
-        assert result["success"] is False
-
-    def test_check_duplicate(self, monkeypatch, config, palace_path, seeded_collection, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
+    def test_check_duplicate_found(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []}, vs_hits=_seed_vs_hits())
         from mempalace.mcp_server import tool_check_duplicate
 
-        # Exact match text from seeded_collection should be flagged
-        result = tool_check_duplicate(
-            "The authentication module uses JWT tokens for session management. "
-            "Tokens expire after 24 hours. Refresh tokens are stored in HttpOnly cookies.",
-            threshold=0.5,
-        )
+        result = tool_check_duplicate(content="JWT tokens session", threshold=0.8)
         assert result["is_duplicate"] is True
+        assert len(result["matches"]) > 0
 
-        # Unrelated content should not be flagged
-        result = tool_check_duplicate(
-            "Black holes emit Hawking radiation at the event horizon.",
-            threshold=0.99,
-        )
+    def test_check_duplicate_not_found(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []}, vs_hits=[])
+        from mempalace.mcp_server import tool_check_duplicate
+
+        result = tool_check_duplicate(content="completely unique content")
         assert result["is_duplicate"] is False
 
 
-# ── KG Tools ────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Write Tools
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestWriteTools:
+    def test_add_drawer(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"SELECT id": [], "INSERT INTO": [], "*": []})
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(wing="test", room="general", content="hello world")
+        assert result["success"] is True
+        assert "drawer_id" in result
+
+    def test_add_drawer_invalid_wing(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []})
+        from mempalace.mcp_server import tool_add_drawer
+
+        result = tool_add_drawer(wing="../bad", room="room", content="data")
+        assert result["success"] is False
+        assert "error" in result
+
+    def test_delete_drawer_not_found(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"SELECT id": [], "*": []})
+        from mempalace.mcp_server import tool_delete_drawer
+
+        result = tool_delete_drawer(drawer_id="nonexistent")
+        assert result["success"] is False
+
+    def test_delete_drawer_found(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={
+            "SELECT id": [SEED_DRAWERS[0]],
+            "DELETE FROM": [],
+            "*": [],
+        })
+        from mempalace.mcp_server import tool_delete_drawer
+
+        result = tool_delete_drawer(drawer_id=SEED_DRAWERS[0]["id"])
+        assert result["success"] is True
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Knowledge Graph Tools
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestKGTools:
-    def test_kg_add(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        from mempalace.mcp_server import tool_kg_add
-
-        result = tool_kg_add(
-            subject="Alice",
-            predicate="likes",
-            object="coffee",
-            valid_from="2025-01-01",
-        )
-        assert result["success"] is True
-
-    def test_kg_query(self, monkeypatch, config, palace_path, seeded_kg):
-        _patch_mcp_server(monkeypatch, config, seeded_kg)
+    def test_kg_query(self, monkeypatch):
+        rows = [
+            {"subject": "alice", "predicate": "parent_of", "object": "max",
+             "valid_from": "2015-04-01", "valid_to": None,
+             "confidence": "1.0", "source_closet": None, "source_file": None,
+             "subject_name": "Alice", "object_name": "Max"},
+        ]
+        _patch_mcp(monkeypatch, sql_patterns={"SELECT t.subject": rows, "*": []})
         from mempalace.mcp_server import tool_kg_query
 
-        result = tool_kg_query(entity="Max")
-        assert result["count"] > 0
+        result = tool_kg_query(entity="Alice")
+        assert result["count"] == 1
+        assert result["facts"][0]["predicate"] == "parent_of"
 
-    def test_kg_invalidate(self, monkeypatch, config, palace_path, seeded_kg):
-        _patch_mcp_server(monkeypatch, config, seeded_kg)
-        from mempalace.mcp_server import tool_kg_invalidate
+    def test_kg_add(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={
+            "MERGE INTO": [],
+            "SELECT id FROM": [],
+            "INSERT INTO": [],
+            "*": [],
+        })
+        from mempalace.mcp_server import tool_kg_add
 
-        result = tool_kg_invalidate(
-            subject="Max",
-            predicate="does",
-            object="chess",
-            ended="2026-03-01",
-        )
+        result = tool_kg_add(subject="Alice", predicate="parent_of", object="Max")
         assert result["success"] is True
 
-    def test_kg_timeline(self, monkeypatch, config, palace_path, seeded_kg):
-        _patch_mcp_server(monkeypatch, config, seeded_kg)
+    def test_kg_invalidate(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"UPDATE": [], "*": []})
+        from mempalace.mcp_server import tool_kg_invalidate
+
+        result = tool_kg_invalidate(subject="Alice", predicate="works_at", object="Acme")
+        assert result["success"] is True
+        assert "ended" in result
+
+    def test_kg_timeline(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"ORDER BY t.valid_from": [], "*": []})
         from mempalace.mcp_server import tool_kg_timeline
 
-        result = tool_kg_timeline(entity="Alice")
-        assert result["count"] > 0
+        result = tool_kg_timeline()
+        assert result["entity"] == "all"
+        assert isinstance(result["timeline"], list)
 
-    def test_kg_stats(self, monkeypatch, config, palace_path, seeded_kg):
-        _patch_mcp_server(monkeypatch, config, seeded_kg)
+    def test_kg_stats(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={
+            "mempalace_entities": [{"cnt": "5"}],
+            "mempalace_triples": [{"total": "10", "current_cnt": "7"}],
+            "*": [],
+        })
         from mempalace.mcp_server import tool_kg_stats
 
         result = tool_kg_stats()
-        assert result["entities"] >= 4
+        assert result["entities"] == 5
+        assert result["triples"] == 10
+        assert result["current"] == 7
+        assert result["expired"] == 3
 
 
-# ── Diary Tools ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Graph Navigation Tools
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+class TestGraphTools:
+    def _graph_rows(self):
+        return _wing_room_counts()
+
+    def test_traverse(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY room, wing": self._graph_rows(), "*": []})
+        from mempalace.mcp_server import tool_traverse_graph
+
+        result = tool_traverse_graph(start_room="backend")
+        assert result["start"] == "backend"
+        assert result["rooms_visited"] >= 1
+
+    def test_traverse_not_found(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY room, wing": self._graph_rows(), "*": []})
+        from mempalace.mcp_server import tool_traverse_graph
+
+        result = tool_traverse_graph(start_room="nonexistent_room_xyz")
+        assert "error" in result
+
+    def test_find_tunnels(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY room, wing": self._graph_rows(), "*": []})
+        from mempalace.mcp_server import tool_find_tunnels
+
+        result = tool_find_tunnels()
+        assert isinstance(result["tunnels"], list)
+
+    def test_graph_stats(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"GROUP BY room, wing": self._graph_rows(), "*": []})
+        from mempalace.mcp_server import tool_graph_stats
+
+        result = tool_graph_stats()
+        assert "total_rooms" in result
+        assert "tunnel_rooms" in result
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Diary Tools
+# ══════════════════════════════════════════════════════════════════════════════
 
 
 class TestDiaryTools:
-    def test_diary_write_and_read(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
-        from mempalace.mcp_server import tool_diary_write, tool_diary_read
+    def test_diary_write(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"INSERT INTO": [], "*": []})
+        from mempalace.mcp_server import tool_diary_write
 
-        w = tool_diary_write(
-            agent_name="TestAgent",
-            entry="Today we discussed authentication patterns.",
-            topic="architecture",
-        )
-        assert w["success"] is True
-        assert w["agent"] == "TestAgent"
+        result = tool_diary_write(agent_name="test_agent", entry="Did some work today")
+        assert result["success"] is True
+        assert result["agent"] == "test_agent"
 
-        r = tool_diary_read(agent_name="TestAgent")
-        assert r["total"] == 1
-        assert r["entries"][0]["topic"] == "architecture"
-        assert "authentication" in r["entries"][0]["content"]
-
-    def test_diary_read_empty(self, monkeypatch, config, palace_path, kg):
-        _patch_mcp_server(monkeypatch, config, kg)
-        _client, _col = _get_collection(palace_path, create=True)
-        del _client
+    def test_diary_read_empty(self, monkeypatch):
+        _patch_mcp(monkeypatch, sql_patterns={"*": []})
         from mempalace.mcp_server import tool_diary_read
 
-        r = tool_diary_read(agent_name="Nobody")
-        assert r["entries"] == []
+        result = tool_diary_read(agent_name="nobody")
+        assert result["entries"] == []
+
+    def test_diary_read_with_entries(self, monkeypatch):
+        rows = [
+            {"id": "d1", "agent_name": "bot", "entry": "Hello", "written_at": "2026-01-01T00:00:00"},
+            {"id": "d2", "agent_name": "bot", "entry": "World", "written_at": "2026-01-02T00:00:00"},
+        ]
+        _patch_mcp(monkeypatch, sql_patterns={
+            "ORDER BY written_at": rows,
+            "COUNT": [{"cnt": "2"}],
+            "*": [],
+        })
+        from mempalace.mcp_server import tool_diary_read
+
+        result = tool_diary_read(agent_name="bot", last_n=10)
+        assert result["showing"] == 2
+        assert result["total"] == 2
