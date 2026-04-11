@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-convo_miner.py — Mine conversations into the palace.
+convo_miner.py — Mine conversations into the palace (Databricks-native).
 
 Ingests chat exports (Claude Code, ChatGPT, Slack, plain text transcripts).
 Normalizes format, chunks by exchange pair (Q+A = one unit), files to palace.
@@ -12,33 +12,33 @@ import os
 import sys
 import hashlib
 from pathlib import Path
-from datetime import datetime
-from collections import defaultdict
+from datetime import datetime, timezone
+from collections import Counter, defaultdict
+from typing import Dict, List, Optional
 
 from .normalize import normalize
-from .palace import SKIP_DIRS, get_collection, file_already_mined
+from .palace import (
+    SKIP_DIRS,
+    add_drawers,
+    file_already_mined,
+    make_drawer_id,
+)
+from .config import DatabricksConfig
 
 
-# File types that might contain conversations
-CONVO_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".json",
-    ".jsonl",
-}
+# ── Constants ─────────────────────────────────────────────────────────────────
 
+CONVO_EXTENSIONS = {".txt", ".md", ".json", ".jsonl"}
 MIN_CHUNK_SIZE = 30
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — skip files larger than this
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
-# =============================================================================
-# CHUNKING — exchange pairs for conversations
-# =============================================================================
+# ── Chunking — exchange pairs for conversations ──────────────────────────────
 
 
-def chunk_exchanges(content: str) -> list:
-    """
-    Chunk by exchange pair: one > turn + AI response = one unit.
+def chunk_exchanges(content: str) -> List[Dict]:
+    """Chunk by exchange pair: one > turn + AI response = one unit.
+
     Falls back to paragraph chunking if no > markers.
     """
     lines = content.split("\n")
@@ -46,13 +46,12 @@ def chunk_exchanges(content: str) -> list:
 
     if quote_lines >= 3:
         return _chunk_by_exchange(lines)
-    else:
-        return _chunk_by_paragraph(content)
+    return _chunk_by_paragraph(content)
 
 
-def _chunk_by_exchange(lines: list) -> list:
+def _chunk_by_exchange(lines: list) -> List[Dict]:
     """One user turn (>) + the AI response that follows = one chunk."""
-    chunks = []
+    chunks: list = []
     i = 0
 
     while i < len(lines):
@@ -61,7 +60,7 @@ def _chunk_by_exchange(lines: list) -> list:
             user_turn = line.strip()
             i += 1
 
-            ai_lines = []
+            ai_lines: list = []
             while i < len(lines):
                 next_line = lines[i]
                 if next_line.strip().startswith(">") or next_line.strip().startswith("---"):
@@ -71,27 +70,22 @@ def _chunk_by_exchange(lines: list) -> list:
                 i += 1
 
             ai_response = " ".join(ai_lines[:8])
-            content = f"{user_turn}\n{ai_response}" if ai_response else user_turn
+            body = f"{user_turn}\n{ai_response}" if ai_response else user_turn
 
-            if len(content.strip()) > MIN_CHUNK_SIZE:
-                chunks.append(
-                    {
-                        "content": content,
-                        "chunk_index": len(chunks),
-                    }
-                )
+            if len(body.strip()) > MIN_CHUNK_SIZE:
+                chunks.append({"content": body, "chunk_index": len(chunks)})
         else:
             i += 1
 
     return chunks
 
 
-def _chunk_by_paragraph(content: str) -> list:
+def _chunk_by_paragraph(content: str) -> List[Dict]:
     """Fallback: chunk by paragraph breaks."""
-    chunks = []
+    chunks: list = []
     paragraphs = [p.strip() for p in content.split("\n\n") if p.strip()]
 
-    # If no paragraph breaks and long content, chunk by line groups
+    # Long content with no paragraph breaks → chunk by line groups
     if len(paragraphs) <= 1 and content.count("\n") > 20:
         lines = content.split("\n")
         for i in range(0, len(lines), 25):
@@ -107,73 +101,28 @@ def _chunk_by_paragraph(content: str) -> list:
     return chunks
 
 
-# =============================================================================
-# ROOM DETECTION — topic-based for conversations
-# =============================================================================
+# ── Room detection — topic-based for conversations ───────────────────────────
 
 TOPIC_KEYWORDS = {
     "technical": [
-        "code",
-        "python",
-        "function",
-        "bug",
-        "error",
-        "api",
-        "database",
-        "server",
-        "deploy",
-        "git",
-        "test",
-        "debug",
-        "refactor",
+        "code", "python", "function", "bug", "error", "api",
+        "database", "server", "deploy", "git", "test", "debug", "refactor",
     ],
     "architecture": [
-        "architecture",
-        "design",
-        "pattern",
-        "structure",
-        "schema",
-        "interface",
-        "module",
-        "component",
-        "service",
-        "layer",
+        "architecture", "design", "pattern", "structure", "schema",
+        "interface", "module", "component", "service", "layer",
     ],
     "planning": [
-        "plan",
-        "roadmap",
-        "milestone",
-        "deadline",
-        "priority",
-        "sprint",
-        "backlog",
-        "scope",
-        "requirement",
-        "spec",
+        "plan", "roadmap", "milestone", "deadline", "priority",
+        "sprint", "backlog", "scope", "requirement", "spec",
     ],
     "decisions": [
-        "decided",
-        "chose",
-        "picked",
-        "switched",
-        "migrated",
-        "replaced",
-        "trade-off",
-        "alternative",
-        "option",
-        "approach",
+        "decided", "chose", "picked", "switched", "migrated",
+        "replaced", "trade-off", "alternative", "option", "approach",
     ],
     "problems": [
-        "problem",
-        "issue",
-        "broken",
-        "failed",
-        "crash",
-        "stuck",
-        "workaround",
-        "fix",
-        "solved",
-        "resolved",
+        "problem", "issue", "broken", "failed", "crash",
+        "stuck", "workaround", "fix", "solved", "resolved",
     ],
 }
 
@@ -191,60 +140,57 @@ def detect_convo_room(content: str) -> str:
     return "general"
 
 
-# =============================================================================
-# PALACE OPERATIONS
-# =============================================================================
+# ── Scan for conversation files ───────────────────────────────────────────────
 
 
-# =============================================================================
-# SCAN FOR CONVERSATION FILES
-# =============================================================================
-
-
-def scan_convos(convo_dir: str) -> list:
-    """Find all potential conversation files."""
+def scan_convos(convo_dir: str) -> List[Path]:
+    """Find all potential conversation files under *convo_dir*."""
     convo_path = Path(convo_dir).expanduser().resolve()
-    files = []
+    files: List[Path] = []
     for root, dirs, filenames in os.walk(convo_path):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
         for filename in filenames:
             if filename.endswith(".meta.json"):
                 continue
             filepath = Path(root) / filename
-            if filepath.suffix.lower() in CONVO_EXTENSIONS:
-                # Skip symlinks and oversized files
-                if filepath.is_symlink():
+            if filepath.suffix.lower() not in CONVO_EXTENSIONS:
+                continue
+            if filepath.is_symlink():
+                continue
+            try:
+                if filepath.stat().st_size > MAX_FILE_SIZE:
                     continue
-                try:
-                    if filepath.stat().st_size > MAX_FILE_SIZE:
-                        continue
-                except OSError:
-                    continue
-                files.append(filepath)
+            except OSError:
+                continue
+            files.append(filepath)
     return files
 
 
-# =============================================================================
-# MINE CONVERSATIONS
-# =============================================================================
+# ── Mine conversations ────────────────────────────────────────────────────────
 
 
 def mine_convos(
     convo_dir: str,
-    palace_path: str,
-    wing: str = None,
+    config: Optional[DatabricksConfig] = None,
+    wing: Optional[str] = None,
     agent: str = "mempalace",
     limit: int = 0,
     dry_run: bool = False,
     extract_mode: str = "exchange",
-):
+) -> None:
     """Mine a directory of conversation files into the palace.
 
-    extract_mode:
-        "exchange" — default exchange-pair chunking (Q+A = one unit)
-        "general"  — general extractor: decisions, preferences, milestones, problems, emotions
+    Args:
+        convo_dir: Directory containing conversation files.
+        config: Databricks configuration. Uses defaults if not provided.
+        wing: Wing name. Defaults to the directory basename.
+        agent: Agent identifier for provenance tracking.
+        limit: Max files to process (0 = unlimited).
+        dry_run: If True, print what would happen without writing.
+        extract_mode: ``"exchange"`` (Q+A pairs) or ``"general"``
+            (decisions, preferences, milestones, problems, emotions).
     """
-
+    config = config or DatabricksConfig()
     convo_path = Path(convo_dir).expanduser().resolve()
     if not wing:
         wing = convo_path.name.lower().replace(" ", "_").replace("-", "_")
@@ -259,22 +205,20 @@ def mine_convos(
     print(f"  Wing:    {wing}")
     print(f"  Source:  {convo_path}")
     print(f"  Files:   {len(files)}")
-    print(f"  Palace:  {palace_path}")
+    print(f"  Target:  {config.drawers_table}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     print(f"{'-' * 55}\n")
 
-    collection = get_collection(palace_path) if not dry_run else None
-
     total_drawers = 0
     files_skipped = 0
-    room_counts = defaultdict(int)
+    room_counts: Dict[str, int] = defaultdict(int)
 
     for i, filepath in enumerate(files, 1):
         source_file = str(filepath)
 
         # Skip if already filed
-        if not dry_run and file_already_mined(collection, source_file):
+        if not dry_run and file_already_mined(config, source_file):
             files_skipped += 1
             continue
 
@@ -290,9 +234,7 @@ def mine_convos(
         # Chunk — either exchange pairs or general extraction
         if extract_mode == "general":
             from .general_extractor import extract_memories
-
             chunks = extract_memories(content)
-            # Each chunk already has memory_type; use it as the room name
         else:
             chunks = chunk_exchanges(content)
 
@@ -305,17 +247,15 @@ def mine_convos(
         else:
             room = None  # set per-chunk below
 
+        # ── Dry-run reporting ─────────────────────────────────────────
         if dry_run:
             if extract_mode == "general":
-                from collections import Counter
-
                 type_counts = Counter(c.get("memory_type", "general") for c in chunks)
                 types_str = ", ".join(f"{t}:{n}" for t, n in type_counts.most_common())
                 print(f"    [DRY RUN] {filepath.name} → {len(chunks)} memories ({types_str})")
             else:
                 print(f"    [DRY RUN] {filepath.name} → room:{room} ({len(chunks)} drawers)")
             total_drawers += len(chunks)
-            # Track room counts
             if extract_mode == "general":
                 for c in chunks:
                     room_counts[c.get("memory_type", "general")] += 1
@@ -323,38 +263,34 @@ def mine_convos(
                 room_counts[room] += 1
             continue
 
+        # ── Build drawer dicts and batch-insert ───────────────────────
         if extract_mode != "general":
             room_counts[room] += 1
 
-        # File each chunk
-        drawers_added = 0
+        try:
+            mtime = os.path.getmtime(source_file)
+        except OSError:
+            mtime = None
+
+        drawer_dicts: list = []
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts[chunk_room] += 1
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-            try:
-                collection.upsert(
-                    documents=[chunk["content"]],
-                    ids=[drawer_id],
-                    metadatas=[
-                        {
-                            "wing": wing,
-                            "room": chunk_room,
-                            "source_file": source_file,
-                            "chunk_index": chunk["chunk_index"],
-                            "added_by": agent,
-                            "filed_at": datetime.now().isoformat(),
-                            "ingest_mode": "convos",
-                            "extract_mode": extract_mode,
-                        }
-                    ],
-                )
-                drawers_added += 1
-            except Exception as e:
-                if "already exists" not in str(e).lower():
-                    raise
 
+            drawer_dicts.append({
+                "id": make_drawer_id(wing, chunk_room, source_file, chunk["chunk_index"]),
+                "text": chunk["content"],
+                "wing": wing,
+                "room": chunk_room,
+                "source_file": source_file,
+                "source_mtime": mtime,
+                "chunk_index": chunk["chunk_index"],
+                "importance": 3.0,
+                "agent": agent,
+            })
+
+        drawers_added = add_drawers(config, drawer_dicts)
         total_drawers += drawers_added
         print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
 
@@ -373,8 +309,6 @@ def mine_convos(
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: python convo_miner.py <convo_dir> [--palace PATH] [--limit N] [--dry-run]")
+        print("Usage: python convo_miner.py <convo_dir> [--limit N] [--dry-run]")
         sys.exit(1)
-    from .config import MempalaceConfig
-
-    mine_convos(sys.argv[1], palace_path=MempalaceConfig().palace_path)
+    mine_convos(sys.argv[1], config=DatabricksConfig())
