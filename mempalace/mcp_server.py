@@ -1,184 +1,196 @@
 #!/usr/bin/env python3
 """
-MemPalace MCP Server — read/write palace access for Claude Code
-================================================================
-Install: claude mcp add mempalace -- python -m mempalace.mcp_server [--palace /path/to/palace]
+MemPalace MCP Server — read/write palace access (Databricks-native).
+====================================================================
+
+Databricks App mode:
+    Deployed as a Databricks App. SQL via Statement Execution API,
+    semantic search via Mosaic AI Vector Search. No Spark needed.
+
+CLI mode (legacy):
+    python -m mempalace.mcp_server
+    Requires MEMPALACE_WAREHOUSE_ID env var for SQL execution.
 
 Tools (read):
   mempalace_status          — total drawers, wing/room breakdown
   mempalace_list_wings      — all wings with drawer counts
   mempalace_list_rooms      — rooms within a wing
   mempalace_get_taxonomy    — full wing → room → count tree
-  mempalace_search          — semantic search, optional wing/room filter
-  mempalace_check_duplicate — check if content already exists before filing
+  mempalace_get_aaak_spec   — AAAK compressed-memory dialect spec
+  mempalace_search          — hybrid semantic + keyword search
+  mempalace_check_duplicate — check if content already exists
 
 Tools (write):
   mempalace_add_drawer      — file verbatim content into a wing/room
   mempalace_delete_drawer   — remove a drawer by ID
+
+Tools (knowledge graph):
+  mempalace_kg_query        — query entity relationships
+  mempalace_kg_add          — add a fact (subject → predicate → object)
+  mempalace_kg_invalidate   — mark a fact as no longer true
+  mempalace_kg_timeline     — chronological timeline of facts
+  mempalace_kg_stats        — KG overview
+
+Tools (graph navigation):
+  mempalace_traverse        — BFS walk through palace rooms
+  mempalace_find_tunnels    — rooms bridging two wings
+  mempalace_graph_stats     — palace graph overview
+
+Tools (agent diary):
+  mempalace_diary_write     — write a diary entry
+  mempalace_diary_read      — read recent diary entries
 """
 
-import argparse
-import os
-import sys
+import hashlib
 import json
 import logging
-import hashlib
-from datetime import datetime
-from pathlib import Path
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-from .config import MempalaceConfig, sanitize_name, sanitize_content
-from .version import __version__
+from .config import DatabricksConfig, sanitize_content, sanitize_name
 from .query_sanitizer import sanitize_query
-from .searcher import search_memories
-from .palace_graph import traverse, find_tunnels, graph_stats
-import chromadb
-
-from .knowledge_graph import KnowledgeGraph
+from .version import __version__
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
 
 
-def _parse_args():
-    parser = argparse.ArgumentParser(description="MemPalace MCP Server")
-    parser.add_argument(
-        "--palace",
-        metavar="PATH",
-        help="Path to the palace directory (overrides config file and env var)",
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+_config = DatabricksConfig()
+
+
+# ── Lazy SDK clients ──────────────────────────────────────────────────────────
+
+_ws_client = None
+_vs_client = None
+
+
+def _get_ws() -> "WorkspaceClient":
+    """Return a cached ``WorkspaceClient`` (auto-auth from env / app identity)."""
+    global _ws_client
+    if _ws_client is None:
+        from databricks.sdk import WorkspaceClient
+        _ws_client = WorkspaceClient()
+    return _ws_client
+
+
+def _get_vsc() -> "VectorSearchClient":
+    """Return a cached ``VectorSearchClient``."""
+    global _vs_client
+    if _vs_client is None:
+        from databricks.vector_search.client import VectorSearchClient
+        _vs_client = VectorSearchClient()
+    return _vs_client
+
+
+def _warehouse_id() -> str:
+    """Resolve the SQL warehouse ID from environment."""
+    wid = os.environ.get("MEMPALACE_WAREHOUSE_ID", "")
+    if not wid:
+        raise RuntimeError(
+            "MEMPALACE_WAREHOUSE_ID env var is required. "
+            "Set it in app.yaml or export it before running."
+        )
+    return wid
+
+
+# ── SQL & VS helpers ──────────────────────────────────────────────────────────
+
+
+def _sql(query: str) -> List[Dict[str, Optional[str]]]:
+    """Execute SQL via the Statement Execution API.
+
+    Returns:
+        List of row dicts.  All values are strings (or None) because the
+        Statement API serialises every column as text.
+    """
+    from databricks.sdk.service.sql import StatementState
+
+    resp = _get_ws().statement_execution.execute_statement(
+        warehouse_id=_warehouse_id(),
+        statement=query,
+        wait_timeout="30s",
     )
-    args, unknown = parser.parse_known_args()
-    if unknown:
-        logger.debug("Ignoring unknown args: %s", unknown)
-    return args
+    if resp.status and resp.status.state == StatementState.FAILED:
+        msg = resp.status.error.message if resp.status.error else "Unknown SQL error"
+        raise RuntimeError(f"SQL failed: {msg}")
+
+    if not resp.manifest or not resp.result or not resp.result.data_array:
+        return []
+
+    columns = [c.name for c in resp.manifest.schema.columns]
+    return [dict(zip(columns, row)) for row in resp.result.data_array]
 
 
-_args = _parse_args()
-
-if _args.palace:
-    os.environ["MEMPALACE_PALACE_PATH"] = os.path.abspath(_args.palace)
-
-_config = MempalaceConfig()
-if _args.palace:
-    _kg = KnowledgeGraph(db_path=os.path.join(_config.palace_path, "knowledge_graph.sqlite3"))
-else:
-    _kg = KnowledgeGraph()
+def _esc(value: str) -> str:
+    """Escape single quotes for SQL string interpolation."""
+    if value is None:
+        return ""
+    return str(value).replace("'", "\\'")
 
 
-_client_cache = None
-_collection_cache = None
+def _entity_id(name: str) -> str:
+    """Derive a stable entity key from a display name."""
+    return name.strip().lower().replace(" ", "_")
 
 
-# ==================== WRITE-AHEAD LOG ====================
-# Every write operation is logged to a JSONL file before execution.
-# This provides an audit trail for detecting memory poisoning and
-# enables review/rollback of writes from external or untrusted sources.
+def _vs_search(
+    query_text: str,
+    columns: List[str],
+    num_results: int = 5,
+    filters: Optional[Dict[str, str]] = None,
+) -> List[Dict[str, Any]]:
+    """Run a hybrid similarity search and return row-dicts with a ``score`` key."""
+    index = _get_vsc().get_index(
+        endpoint_name=_config.vs_endpoint,
+        index_name=_config.vs_index_name,
+    )
+    resp = index.similarity_search(
+        query_text=query_text,
+        columns=columns,
+        num_results=num_results,
+        filters=filters,
+        query_type="hybrid",
+    )
+    col_names = [c["name"] for c in resp.get("manifest", {}).get("columns", [])]
+    rows: List[Dict[str, Any]] = []
+    for row in resp.get("result", {}).get("data_array", []):
+        rows.append(dict(zip(col_names, row)))
+    return rows
 
-_WAL_DIR = Path(os.path.expanduser("~/.mempalace/wal"))
-_WAL_DIR.mkdir(parents=True, exist_ok=True)
-try:
-    _WAL_DIR.chmod(0o700)
-except (OSError, NotImplementedError):
-    pass
-_WAL_FILE = _WAL_DIR / "write_log.jsonl"
+
+# ── Write-Ahead Log ───────────────────────────────────────────────────────────
 
 
-def _wal_log(operation: str, params: dict, result: dict = None):
-    """Append a write operation to the write-ahead log."""
-    entry = {
-        "timestamp": datetime.now().isoformat(),
-        "operation": operation,
-        "params": params,
-        "result": result,
-    }
+def _wal_log(operation: str, params: dict, result: Optional[dict] = None) -> None:
+    """Append an audit entry to the WAL Delta table."""
+    now = datetime.now(timezone.utc).isoformat()
     try:
-        with open(_WAL_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, default=str) + "\n")
-        try:
-            _WAL_FILE.chmod(0o600)
-        except (OSError, NotImplementedError):
-            pass
-    except Exception as e:
-        logger.error(f"WAL write failed: {e}")
+        _sql(f"""
+            INSERT INTO {_config.wal_table}
+            (timestamp, operation, params, result, caller)
+            VALUES ('{now}', '{_esc(operation)}',
+                    '{_esc(json.dumps(params, default=str))}',
+                    '{_esc(json.dumps(result, default=str) if result else "")}',
+                    current_user())
+        """)
+    except Exception as exc:
+        logger.error("WAL write failed: %s", exc)
 
 
-_client_cache = None
-_collection_cache = None
-
-
-def _get_client():
-    """Return a singleton ChromaDB PersistentClient."""
-    global _client_cache
-    if _client_cache is None:
-        _client_cache = chromadb.PersistentClient(path=_config.palace_path)
-    return _client_cache
-
-
-def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls."""
-    global _collection_cache
-    try:
-        client = _get_client()
-        if create:
-            _collection_cache = client.get_or_create_collection(_config.collection_name)
-        elif _collection_cache is None:
-            _collection_cache = client.get_collection(_config.collection_name)
-        return _collection_cache
-    except Exception:
-        return None
-
-
-def _no_palace():
+def _no_palace() -> dict:
+    """Standard error when tables are not reachable."""
     return {
-        "error": "No palace found",
-        "hint": "Run: mempalace init <dir> && mempalace mine <dir>",
+        "error": "Palace tables not found",
+        "hint": "Run the setup_mempalace notebook first.",
     }
-
-
-# ==================== READ TOOLS ====================
-
-
-def tool_status():
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    count = col.count()
-    wings = {}
-    rooms = {}
-    batch_size = 5000
-    offset = 0
-    error_info = None
-    while True:
-        try:
-            batch = col.get(include=["metadatas"], limit=batch_size, offset=offset)
-            rows = batch["metadatas"]
-            for m in rows:
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                wings[w] = wings.get(w, 0) + 1
-                rooms[r] = rooms.get(r, 0) + 1
-            offset += len(rows)
-            if len(rows) < batch_size:
-                break
-        except Exception as e:
-            error_info = f"Partial result, failed at offset {offset}: {str(e)}"
-            break
-    result = {
-        "total_drawers": count,
-        "wings": wings,
-        "rooms": rooms,
-        "palace_path": _config.palace_path,
-        "protocol": PALACE_PROTOCOL,
-        "aaak_dialect": AAAK_SPEC,
-    }
-    if error_info:
-        result["error"] = error_info
-        result["partial"] = True
-    return result
 
 
 # ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
-# Included in status response so the AI learns it on first wake-up call.
-# Also available via mempalace_get_aaak_spec tool.
 
 PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
 1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
@@ -209,403 +221,625 @@ Read AAAK naturally — expand codes mentally, treat *markers* as emotional cont
 When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
-def tool_list_wings():
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    wings = {}
-    batch_size = 5000
-    offset = 0
+# ── Read tools ────────────────────────────────────────────────────────────────
+
+
+def tool_status() -> dict:
+    """Palace overview — total drawers, wing and room counts."""
     try:
-        col.count()  # verify collection is accessible
-    except Exception as e:
-        return {"wings": {}, "error": str(e)}
-    while True:
-        try:
-            batch = col.get(include=["metadatas"], limit=batch_size, offset=offset)
-            rows = batch["metadatas"]
-            for m in rows:
-                w = m.get("wing", "unknown")
-                wings[w] = wings.get(w, 0) + 1
-            offset += len(rows)
-            if len(rows) < batch_size:
-                break
-        except Exception as e:
-            return {
-                "wings": wings,
-                "error": f"Partial result, failed at offset {offset}: {str(e)}",
-                "partial": True,
-            }
-    return {"wings": wings}
-
-
-def tool_list_rooms(wing: str = None):
-    col = _get_collection()
-    if not col:
+        rows = _sql(f"""
+            SELECT wing, room, COUNT(*) AS cnt
+            FROM {_config.drawers_table}
+            GROUP BY wing, room
+        """)
+    except Exception:
         return _no_palace()
-    rooms = {}
-    batch_size = 5000
-    offset = 0
-    where = {"wing": wing} if wing else None
-    try:
-        col.count()  # verify collection is accessible
-    except Exception as e:
-        return {"wing": wing or "all", "rooms": {}, "error": str(e)}
-    while True:
-        try:
-            kwargs = {"include": ["metadatas"], "limit": batch_size, "offset": offset}
-            if where:
-                kwargs["where"] = where
-            batch = col.get(**kwargs)
-            rows = batch["metadatas"]
-            for m in rows:
-                r = m.get("room", "unknown")
-                rooms[r] = rooms.get(r, 0) + 1
-            offset += len(rows)
-            if len(rows) < batch_size:
-                break
-        except Exception as e:
-            return {
-                "wing": wing or "all",
-                "rooms": rooms,
-                "error": f"Partial result, failed at offset {offset}: {str(e)}",
-                "partial": True,
-            }
-    return {"wing": wing or "all", "rooms": rooms}
+
+    total = sum(int(r["cnt"]) for r in rows)
+    wings: Dict[str, int] = {}
+    rooms: Dict[str, int] = {}
+    for r in rows:
+        w, rm, c = r["wing"], r["room"], int(r["cnt"])
+        wings[w] = wings.get(w, 0) + c
+        rooms[rm] = rooms.get(rm, 0) + c
+
+    return {
+        "total_drawers": total,
+        "wings": wings,
+        "rooms": rooms,
+        "target": _config.drawers_table,
+        "protocol": PALACE_PROTOCOL,
+        "aaak_dialect": AAAK_SPEC,
+    }
 
 
-def tool_get_taxonomy():
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    taxonomy = {}
-    batch_size = 5000
-    offset = 0
+def tool_list_wings() -> dict:
+    """List all wings with drawer counts."""
     try:
-        col.count()  # verify collection is accessible
-    except Exception as e:
-        return {"taxonomy": {}, "error": str(e)}
-    while True:
-        try:
-            batch = col.get(include=["metadatas"], limit=batch_size, offset=offset)
-            rows = batch["metadatas"]
-            for m in rows:
-                w = m.get("wing", "unknown")
-                r = m.get("room", "unknown")
-                if w not in taxonomy:
-                    taxonomy[w] = {}
-                taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
-            offset += len(rows)
-            if len(rows) < batch_size:
-                break
-        except Exception as e:
-            return {
-                "taxonomy": taxonomy,
-                "error": f"Partial result, failed at offset {offset}: {str(e)}",
-                "partial": True,
-            }
+        rows = _sql(
+            f"SELECT wing, COUNT(*) AS cnt FROM {_config.drawers_table} GROUP BY wing"
+        )
+    except Exception as exc:
+        return {"wings": {}, "error": str(exc)}
+    return {"wings": {r["wing"]: int(r["cnt"]) for r in rows}}
+
+
+def tool_list_rooms(wing: Optional[str] = None) -> dict:
+    """List rooms within a wing (or all rooms if no wing given)."""
+    where = f" WHERE wing = '{_esc(wing)}'" if wing else ""
+    try:
+        rows = _sql(
+            f"SELECT room, COUNT(*) AS cnt FROM {_config.drawers_table}{where} GROUP BY room"
+        )
+    except Exception as exc:
+        return {"wing": wing or "all", "rooms": {}, "error": str(exc)}
+    return {"wing": wing or "all", "rooms": {r["room"]: int(r["cnt"]) for r in rows}}
+
+
+def tool_get_taxonomy() -> dict:
+    """Full taxonomy: wing → room → drawer count."""
+    try:
+        rows = _sql(f"""
+            SELECT wing, room, COUNT(*) AS cnt
+            FROM {_config.drawers_table}
+            GROUP BY wing, room
+        """)
+    except Exception as exc:
+        return {"taxonomy": {}, "error": str(exc)}
+
+    taxonomy: Dict[str, Dict[str, int]] = {}
+    for r in rows:
+        w = r["wing"]
+        if w not in taxonomy:
+            taxonomy[w] = {}
+        taxonomy[w][r["room"]] = int(r["cnt"])
     return {"taxonomy": taxonomy}
 
 
+def tool_get_aaak_spec() -> dict:
+    """Return the AAAK dialect specification."""
+    return {"aaak_spec": AAAK_SPEC}
+
+
+def tool_check_duplicate(content: str, threshold: float = 0.9) -> dict:
+    """Check if content already exists in the palace before filing."""
+    try:
+        hits = _vs_search(
+            query_text=content,
+            columns=["id", "text", "wing", "room"],
+            num_results=5,
+        )
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    duplicates = []
+    for h in hits:
+        score = float(h.get("score", 0))
+        if score >= threshold:
+            text = h.get("text", "")
+            duplicates.append({
+                "id": h.get("id", ""),
+                "wing": h.get("wing", ""),
+                "room": h.get("room", ""),
+                "similarity": round(score, 3),
+                "content": text[:200] + "..." if len(text) > 200 else text,
+            })
+    return {"is_duplicate": len(duplicates) > 0, "matches": duplicates}
+
+
+# ── Search ────────────────────────────────────────────────────────────────────
+
+
 def tool_search(
-    query: str, limit: int = 5, wing: str = None, room: str = None, context: str = None
-):
-    # Mitigate system prompt contamination (Issue #333)
+    query: str,
+    limit: int = 5,
+    wing: Optional[str] = None,
+    room: Optional[str] = None,
+    context: Optional[str] = None,
+) -> dict:
+    """Hybrid semantic + keyword search across palace drawers."""
     sanitized = sanitize_query(query)
-    result = search_memories(
-        sanitized["clean_query"],
-        palace_path=_config.palace_path,
-        wing=wing,
-        room=room,
-        n_results=limit,
-    )
-    # Attach sanitizer metadata for transparency
+    q = sanitized["clean_query"]
+
+    filters: Dict[str, str] = {}
+    if wing:
+        filters["wing"] = wing
+    if room:
+        filters["room"] = room
+
+    try:
+        hits = _vs_search(
+            query_text=q,
+            columns=["id", "text", "wing", "room", "source_file", "date", "importance"],
+            num_results=limit,
+            filters=filters or None,
+        )
+    except Exception as exc:
+        return {"error": str(exc), "query": q}
+
+    results = []
+    for h in hits:
+        results.append({
+            "text": h.get("text", ""),
+            "wing": h.get("wing", ""),
+            "room": h.get("room", ""),
+            "source_file": h.get("source_file", ""),
+            "date": h.get("date", ""),
+            "score": h.get("score", 0),
+        })
+
+    out: dict = {"query": q, "filters": {"wing": wing, "room": room}, "results": results}
     if sanitized["was_sanitized"]:
-        result["query_sanitized"] = True
-        result["sanitizer"] = {
+        out["query_sanitized"] = True
+        out["sanitizer"] = {
             "method": sanitized["method"],
             "original_length": sanitized["original_length"],
             "clean_length": sanitized["clean_length"],
             "clean_query": sanitized["clean_query"],
         }
     if context:
-        result["context_received"] = True
-    return result
+        out["context_received"] = True
+    return out
 
 
-def tool_check_duplicate(content: str, threshold: float = 0.9):
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    try:
-        results = col.query(
-            query_texts=[content],
-            n_results=5,
-            include=["metadatas", "documents", "distances"],
-        )
-        duplicates = []
-        if results["ids"] and results["ids"][0]:
-            for i, drawer_id in enumerate(results["ids"][0]):
-                dist = results["distances"][0][i]
-                similarity = round(1 - dist, 3)
-                if similarity >= threshold:
-                    meta = results["metadatas"][0][i]
-                    doc = results["documents"][0][i]
-                    duplicates.append(
-                        {
-                            "id": drawer_id,
-                            "wing": meta.get("wing", "?"),
-                            "room": meta.get("room", "?"),
-                            "similarity": similarity,
-                            "content": doc[:200] + "..." if len(doc) > 200 else doc,
-                        }
-                    )
-        return {
-            "is_duplicate": len(duplicates) > 0,
-            "matches": duplicates,
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-def tool_get_aaak_spec():
-    """Return the AAAK dialect specification."""
-    return {"aaak_spec": AAAK_SPEC}
-
-
-def tool_traverse_graph(start_room: str, max_hops: int = 2):
-    """Walk the palace graph from a room. Find connected ideas across wings."""
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    return traverse(start_room, col=col, max_hops=max_hops)
-
-
-def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
-    """Find rooms that bridge two wings — the hallways connecting domains."""
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    return find_tunnels(wing_a, wing_b, col=col)
-
-
-def tool_graph_stats():
-    """Palace graph overview: nodes, tunnels, edges, connectivity."""
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-    return graph_stats(col=col)
-
-
-# ==================== WRITE TOOLS ====================
+# ── Write tools ───────────────────────────────────────────────────────────────
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
-):
+    wing: str,
+    room: str,
+    content: str,
+    source_file: Optional[str] = None,
+    added_by: str = "mcp",
+) -> dict:
     """File verbatim content into a wing/room. Checks for duplicates first."""
     try:
         wing = sanitize_name(wing, "wing")
         room = sanitize_name(room, "room")
         content = sanitize_content(content)
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
 
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
+    drawer_id = hashlib.sha256(
+        f"{wing}|{room}|{content[:100]}|0".encode()
+    ).hexdigest()
 
-    drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((wing + room + content[:100]).encode()).hexdigest()[:24]}"
+    _wal_log("add_drawer", {
+        "drawer_id": drawer_id,
+        "wing": wing,
+        "room": room,
+        "added_by": added_by,
+        "content_length": len(content),
+        "content_preview": content[:200],
+    })
 
-    _wal_log(
-        "add_drawer",
-        {
-            "drawer_id": drawer_id,
-            "wing": wing,
-            "room": room,
-            "added_by": added_by,
-            "content_length": len(content),
-            "content_preview": content[:200],
-        },
-    )
-
-    # Idempotency: if the deterministic ID already exists, return success as a no-op.
+    # Idempotency check
     try:
-        existing = col.get(ids=[drawer_id])
-        if existing and existing["ids"]:
+        existing = _sql(
+            f"SELECT id FROM {_config.drawers_table} "
+            f"WHERE id = '{drawer_id}' LIMIT 1"
+        )
+        if existing:
             return {"success": True, "reason": "already_exists", "drawer_id": drawer_id}
     except Exception:
         pass
 
+    now = datetime.now(timezone.utc).isoformat()
     try:
-        col.upsert(
-            ids=[drawer_id],
-            documents=[content],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "source_file": source_file or "",
-                    "chunk_index": 0,
-                    "added_by": added_by,
-                    "filed_at": datetime.now().isoformat(),
-                }
-            ],
-        )
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
+        _sql(f"""
+            INSERT INTO {_config.drawers_table}
+            (id, text, wing, room, source_file, chunk_index, importance, agent, filed_at)
+            VALUES ('{drawer_id}', '{_esc(content)}', '{_esc(wing)}', '{_esc(room)}',
+                    '{_esc(source_file or "")}', 0, 3.0, '{_esc(added_by)}', '{now}')
+        """)
+        logger.info("Filed drawer: %s → %s/%s", drawer_id, wing, room)
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
-def tool_delete_drawer(drawer_id: str):
+def tool_delete_drawer(drawer_id: str) -> dict:
     """Delete a single drawer by ID."""
-    col = _get_collection()
-    if not col:
+    try:
+        existing = _sql(
+            f"SELECT id, text, wing, room FROM {_config.drawers_table} "
+            f"WHERE id = '{_esc(drawer_id)}' LIMIT 1"
+        )
+    except Exception:
         return _no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
+
+    if not existing:
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
 
-    # Log the deletion with the content being removed for audit trail
-    deleted_content = existing.get("documents", [""])[0] if existing.get("documents") else ""
-    deleted_meta = existing.get("metadatas", [{}])[0] if existing.get("metadatas") else {}
-    _wal_log(
-        "delete_drawer",
-        {
-            "drawer_id": drawer_id,
-            "deleted_meta": deleted_meta,
-            "content_preview": deleted_content[:200],
-        },
-    )
+    _wal_log("delete_drawer", {
+        "drawer_id": drawer_id,
+        "deleted_meta": existing[0],
+        "content_preview": (existing[0].get("text") or "")[:200],
+    })
 
     try:
-        col.delete(ids=[drawer_id])
-        logger.info(f"Deleted drawer: {drawer_id}")
+        _sql(f"DELETE FROM {_config.drawers_table} WHERE id = '{_esc(drawer_id)}'")
+        logger.info("Deleted drawer: %s", drawer_id)
         return {"success": True, "drawer_id": drawer_id}
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
-# ==================== KNOWLEDGE GRAPH ====================
+# ── Knowledge Graph tools ─────────────────────────────────────────────────────
 
 
-def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
+def tool_kg_query(
+    entity: str,
+    as_of: Optional[str] = None,
+    direction: str = "both",
+) -> dict:
     """Query the knowledge graph for an entity's relationships."""
-    results = _kg.query_entity(entity, as_of=as_of, direction=direction)
-    return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
+    eid = _entity_id(entity)
+    conds: List[str] = []
+    if direction in ("outgoing", "both"):
+        conds.append(f"t.subject = '{_esc(eid)}'")
+    if direction in ("incoming", "both"):
+        conds.append(f"t.object = '{_esc(eid)}'")
+    where = " OR ".join(conds)
+
+    time_filter = ""
+    if as_of:
+        time_filter = (
+            f" AND (t.valid_from IS NULL OR t.valid_from <= '{_esc(as_of)}')"
+            f" AND (t.valid_to IS NULL OR t.valid_to >= '{_esc(as_of)}')"
+        )
+
+    rows = _sql(f"""
+        SELECT t.subject, t.predicate, t.object, t.valid_from, t.valid_to,
+               t.confidence, t.source_closet, t.source_file,
+               se.name AS subject_name, oe.name AS object_name
+        FROM {_config.triples_table} t
+        LEFT JOIN {_config.entities_table} se ON t.subject = se.id
+        LEFT JOIN {_config.entities_table} oe ON t.object = oe.id
+        WHERE ({where}){time_filter}
+        ORDER BY t.valid_from NULLS LAST
+    """)
+
+    facts = []
+    for r in rows:
+        facts.append({
+            "subject": r.get("subject_name") or r["subject"],
+            "predicate": r["predicate"],
+            "object": r.get("object_name") or r["object"],
+            "valid_from": r.get("valid_from"),
+            "valid_to": r.get("valid_to"),
+            "confidence": r.get("confidence"),
+            "source": r.get("source_closet") or r.get("source_file"),
+        })
+    return {"entity": entity, "as_of": as_of, "facts": facts, "count": len(facts)}
 
 
 def tool_kg_add(
-    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
-):
+    subject: str,
+    predicate: str,
+    object: str,
+    valid_from: Optional[str] = None,
+    source_closet: Optional[str] = None,
+) -> dict:
     """Add a relationship to the knowledge graph."""
     try:
         subject = sanitize_name(subject, "subject")
         predicate = sanitize_name(predicate, "predicate")
         object = sanitize_name(object, "object")
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
 
-    _wal_log(
-        "kg_add",
-        {
-            "subject": subject,
-            "predicate": predicate,
-            "object": object,
-            "valid_from": valid_from,
-            "source_closet": source_closet,
-        },
-    )
-    triple_id = _kg.add_triple(
-        subject, predicate, object, valid_from=valid_from, source_closet=source_closet
-    )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    _wal_log("kg_add", {
+        "subject": subject, "predicate": predicate, "object": object,
+        "valid_from": valid_from, "source_closet": source_closet,
+    })
 
+    sub_id = _entity_id(subject)
+    obj_id = _entity_id(object)
+    now = datetime.now(timezone.utc).isoformat()
 
-def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
-    """Mark a fact as no longer true (set end date)."""
-    _wal_log(
-        "kg_invalidate",
-        {"subject": subject, "predicate": predicate, "object": object, "ended": ended},
-    )
-    _kg.invalidate(subject, predicate, object, ended=ended)
+    # Ensure both entities exist (INSERT-if-absent)
+    for eid, name in [(sub_id, subject), (obj_id, object)]:
+        _sql(f"""
+            MERGE INTO {_config.entities_table} AS tgt
+            USING (SELECT '{_esc(eid)}' AS id, '{_esc(name)}' AS name) AS src
+            ON tgt.id = src.id
+            WHEN NOT MATCHED THEN INSERT (id, name, type, properties, created_at)
+                VALUES (src.id, src.name, 'unknown', '{{}}'  , '{now}')
+        """)
+
+    # Duplicate check — same SPO with open validity
+    existing = _sql(f"""
+        SELECT id FROM {_config.triples_table}
+        WHERE subject = '{_esc(sub_id)}' AND predicate = '{_esc(predicate)}'
+              AND object = '{_esc(obj_id)}' AND valid_to IS NULL
+        LIMIT 1
+    """)
+    if existing:
+        return {
+            "success": True,
+            "triple_id": existing[0]["id"],
+            "fact": f"{subject} → {predicate} → {object}",
+            "note": "already_exists",
+        }
+
+    triple_id = hashlib.sha256(
+        f"{sub_id}|{predicate}|{obj_id}|{valid_from or ''}".encode()
+    ).hexdigest()
+
+    vf = f"'{_esc(valid_from)}'" if valid_from else "NULL"
+    sc = f"'{_esc(source_closet)}'" if source_closet else "NULL"
+
+    _sql(f"""
+        INSERT INTO {_config.triples_table}
+        (id, subject, predicate, object, valid_from, valid_to,
+         confidence, source_closet, source_file, extracted_at)
+        VALUES ('{triple_id}', '{_esc(sub_id)}', '{_esc(predicate)}', '{_esc(obj_id)}',
+                {vf}, NULL, 1.0, {sc}, NULL, '{now}')
+    """)
     return {
         "success": True,
+        "triple_id": triple_id,
         "fact": f"{subject} → {predicate} → {object}",
-        "ended": ended or "today",
     }
 
 
-def tool_kg_timeline(entity: str = None):
-    """Get chronological timeline of facts, optionally for one entity."""
-    results = _kg.timeline(entity)
-    return {"entity": entity or "all", "timeline": results, "count": len(results)}
+def tool_kg_invalidate(
+    subject: str,
+    predicate: str,
+    object: str,
+    ended: Optional[str] = None,
+) -> dict:
+    """Mark a fact as no longer true (set end date)."""
+    _wal_log("kg_invalidate", {
+        "subject": subject, "predicate": predicate,
+        "object": object, "ended": ended,
+    })
+
+    sub_id = _entity_id(subject)
+    obj_id = _entity_id(object)
+    end_date = ended or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    _sql(f"""
+        UPDATE {_config.triples_table}
+        SET valid_to = '{_esc(end_date)}'
+        WHERE subject = '{_esc(sub_id)}'
+          AND predicate = '{_esc(predicate)}'
+          AND object = '{_esc(obj_id)}'
+          AND valid_to IS NULL
+    """)
+    return {
+        "success": True,
+        "fact": f"{subject} → {predicate} → {object}",
+        "ended": end_date,
+    }
 
 
-def tool_kg_stats():
-    """Knowledge graph overview: entities, triples, relationship types."""
-    return _kg.stats()
+def tool_kg_timeline(entity: Optional[str] = None) -> dict:
+    """Chronological timeline of facts, optionally for one entity."""
+    where = ""
+    if entity:
+        eid = _entity_id(entity)
+        where = f" WHERE t.subject = '{_esc(eid)}' OR t.object = '{_esc(eid)}'"
+
+    rows = _sql(f"""
+        SELECT t.subject, t.predicate, t.object, t.valid_from, t.valid_to,
+               se.name AS subject_name, oe.name AS object_name
+        FROM {_config.triples_table} t
+        LEFT JOIN {_config.entities_table} se ON t.subject = se.id
+        LEFT JOIN {_config.entities_table} oe ON t.object = oe.id
+        {where}
+        ORDER BY t.valid_from NULLS LAST
+    """)
+
+    timeline = []
+    for r in rows:
+        timeline.append({
+            "subject": r.get("subject_name") or r["subject"],
+            "predicate": r["predicate"],
+            "object": r.get("object_name") or r["object"],
+            "valid_from": r.get("valid_from"),
+            "valid_to": r.get("valid_to"),
+            "current": r.get("valid_to") is None,
+        })
+    return {"entity": entity or "all", "timeline": timeline, "count": len(timeline)}
 
 
-# ==================== AGENT DIARY ====================
+def tool_kg_stats() -> dict:
+    """Knowledge graph overview: entities, triples, current vs expired."""
+    ent = _sql(f"SELECT COUNT(*) AS cnt FROM {_config.entities_table}")
+    tri = _sql(f"""
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN valid_to IS NULL THEN 1 ELSE 0 END) AS current_cnt
+        FROM {_config.triples_table}
+    """)
+
+    entities = int(ent[0]["cnt"]) if ent else 0
+    total = int(tri[0]["total"]) if tri else 0
+    current = int(tri[0]["current_cnt"] or 0) if tri else 0
+
+    return {
+        "entities": entities,
+        "triples": total,
+        "current": current,
+        "expired": total - current,
+    }
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
+# ── Graph navigation tools ───────────────────────────────────────────────────
+
+
+def _build_graph() -> tuple:
+    """Build palace graph from Delta aggregation (Statement API version).
+
+    Returns:
+        Tuple of (nodes, edges).
+        nodes: ``{room: {"wings": [str], "count": int}}``
+        edges:  list of ``{"from": str, "to": str, "wing": str}``
     """
-    Write a diary entry for this agent. Each agent gets its own wing
-    with a diary room. Entries are timestamped and accumulate over time.
+    rows = _sql(f"""
+        SELECT room, wing, COUNT(*) AS cnt
+        FROM {_config.drawers_table}
+        WHERE room IS NOT NULL AND wing IS NOT NULL
+        GROUP BY room, wing
+    """)
 
-    This is the agent's personal journal — observations, thoughts,
-    what it worked on, what it noticed, what it thinks matters.
-    """
+    nodes: Dict[str, Dict[str, Any]] = {}
+    wing_rooms: Dict[str, set] = defaultdict(set)
+    for r in rows:
+        rm, w, c = r["room"], r["wing"], int(r["cnt"])
+        if rm not in nodes:
+            nodes[rm] = {"wings": set(), "count": 0}
+        nodes[rm]["wings"].add(w)
+        nodes[rm]["count"] += c
+        wing_rooms[w].add(rm)
+
+    # Build edges: rooms connected through a shared wing
+    edges: list = []
+    for w, rm_set in wing_rooms.items():
+        rm_list = sorted(rm_set)
+        for i in range(len(rm_list)):
+            for j in range(i + 1, len(rm_list)):
+                edges.append({"from": rm_list[i], "to": rm_list[j], "wing": w})
+
+    # Serialise sets → sorted lists
+    for rm in nodes:
+        nodes[rm]["wings"] = sorted(nodes[rm]["wings"])
+
+    return nodes, edges
+
+
+def tool_traverse_graph(start_room: str, max_hops: int = 2) -> dict:
+    """BFS walk through the palace graph from a starting room."""
+    try:
+        nodes, edges = _build_graph()
+    except Exception:
+        return _no_palace()
+
+    if start_room not in nodes:
+        suggestions = [rm for rm in nodes if start_room.lower() in rm.lower()][:5]
+        return {"error": f"Room '{start_room}' not found", "suggestions": suggestions}
+
+    # BFS
+    visited = {start_room}
+    queue = [(start_room, 0)]
+    path: list = []
+
+    while queue:
+        current, depth = queue.pop(0)
+        if depth > max_hops:
+            break
+        nd = nodes.get(current, {})
+        path.append({
+            "room": current,
+            "depth": depth,
+            "wings": nd.get("wings", []),
+            "count": nd.get("count", 0),
+        })
+        if depth < max_hops:
+            for edge in edges:
+                nbr = None
+                if edge["from"] == current:
+                    nbr = edge["to"]
+                elif edge["to"] == current:
+                    nbr = edge["from"]
+                if nbr and nbr not in visited:
+                    visited.add(nbr)
+                    queue.append((nbr, depth + 1))
+
+    return {"start": start_room, "max_hops": max_hops, "path": path, "rooms_visited": len(path)}
+
+
+def tool_find_tunnels(
+    wing_a: Optional[str] = None,
+    wing_b: Optional[str] = None,
+) -> dict:
+    """Find rooms that bridge two wings."""
+    try:
+        nodes, _ = _build_graph()
+    except Exception:
+        return _no_palace()
+
+    tunnels = []
+    for rm, data in nodes.items():
+        if len(data["wings"]) < 2:
+            continue
+        if wing_a and wing_a not in data["wings"]:
+            continue
+        if wing_b and wing_b not in data["wings"]:
+            continue
+        tunnels.append({
+            "room": rm,
+            "wings": data["wings"],
+            "count": data["count"],
+        })
+
+    tunnels.sort(key=lambda x: len(x["wings"]), reverse=True)
+    return {"tunnels": tunnels, "count": len(tunnels)}
+
+
+def tool_graph_stats() -> dict:
+    """Palace graph overview: total rooms, tunnels, edges, connectivity."""
+    try:
+        nodes, edges = _build_graph()
+    except Exception:
+        return _no_palace()
+
+    tunnel_rooms = [rm for rm, d in nodes.items() if len(d["wings"]) >= 2]
+    wing_counts: Dict[str, int] = {}
+    for data in nodes.values():
+        for w in data["wings"]:
+            wing_counts[w] = wing_counts.get(w, 0) + 1
+
+    return {
+        "total_rooms": len(nodes),
+        "tunnel_rooms": len(tunnel_rooms),
+        "total_edges": len(edges),
+        "rooms_per_wing": wing_counts,
+        "top_tunnels": sorted(
+            [{"room": rm, "wings": nodes[rm]["wings"], "count": nodes[rm]["count"]}
+             for rm in tunnel_rooms],
+            key=lambda x: len(x["wings"]),
+            reverse=True,
+        )[:10],
+    }
+
+
+# ── Agent diary tools ─────────────────────────────────────────────────────────
+
+
+def tool_diary_write(
+    agent_name: str,
+    entry: str,
+    topic: str = "general",
+) -> dict:
+    """Write a diary entry for this agent."""
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
         entry = sanitize_content(entry)
-    except ValueError as e:
-        return {"success": False, "error": str(e)}
+    except ValueError as exc:
+        return {"success": False, "error": str(exc)}
 
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
-    room = "diary"
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
-
-    now = datetime.now()
-    entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}_{hashlib.sha256(entry[:50].encode()).hexdigest()[:12]}"
-
-    _wal_log(
-        "diary_write",
-        {
-            "agent_name": agent_name,
-            "topic": topic,
-            "entry_id": entry_id,
-            "entry_preview": entry[:200],
-        },
+    now = datetime.now(timezone.utc)
+    entry_id = (
+        f"diary_{agent_name}_{now.strftime('%Y%m%d_%H%M%S')}_"
+        f"{hashlib.sha256(entry[:50].encode()).hexdigest()[:12]}"
     )
 
+    _wal_log("diary_write", {
+        "agent_name": agent_name,
+        "topic": topic,
+        "entry_id": entry_id,
+        "entry_preview": entry[:200],
+    })
+
     try:
-        # TODO: Future versions should expand AAAK before embedding to improve
-        # semantic search quality. For now, store raw AAAK in metadata so it's
-        # preserved, and keep the document as-is for embedding (even though
-        # compressed AAAK degrades embedding quality).
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "hall": "hall_diary",
-                    "topic": topic,
-                    "type": "diary_entry",
-                    "agent": agent_name,
-                    "filed_at": now.isoformat(),
-                    "date": now.strftime("%Y-%m-%d"),
-                }
-            ],
-        )
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
+        _sql(f"""
+            INSERT INTO {_config.diaries_table}
+            (id, agent_name, entry, written_at)
+            VALUES ('{entry_id}', '{_esc(agent_name)}', '{_esc(entry)}', '{now.isoformat()}')
+        """)
+        logger.info("Diary entry: %s → %s/%s", entry_id, agent_name, topic)
         return {
             "success": True,
             "entry_id": entry_id,
@@ -613,56 +847,43 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
             "topic": topic,
             "timestamp": now.isoformat(),
         }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+    except Exception as exc:
+        return {"success": False, "error": str(exc)}
 
 
-def tool_diary_read(agent_name: str, last_n: int = 10):
-    """
-    Read an agent's recent diary entries. Returns the last N entries
-    in chronological order — the agent's personal journal.
-    """
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-
+def tool_diary_read(agent_name: str, last_n: int = 10) -> dict:
+    """Read an agent's recent diary entries."""
     try:
-        results = col.get(
-            where={"$and": [{"wing": wing}, {"room": "diary"}]},
-            include=["documents", "metadatas"],
-            limit=10000,
-        )
+        rows = _sql(f"""
+            SELECT id, agent_name, entry, written_at
+            FROM {_config.diaries_table}
+            WHERE agent_name = '{_esc(agent_name)}'
+            ORDER BY written_at DESC
+            LIMIT {int(last_n)}
+        """)
+    except Exception as exc:
+        return {"error": str(exc)}
 
-        if not results["ids"]:
-            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
+    if not rows:
+        return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
 
-        # Combine and sort by timestamp
-        entries = []
-        for doc, meta in zip(results["documents"], results["metadatas"]):
-            entries.append(
-                {
-                    "date": meta.get("date", ""),
-                    "timestamp": meta.get("filed_at", ""),
-                    "topic": meta.get("topic", ""),
-                    "content": doc,
-                }
-            )
+    entries = [{"timestamp": r["written_at"], "content": r["entry"]} for r in rows]
 
-        entries.sort(key=lambda x: x["timestamp"], reverse=True)
-        entries = entries[:last_n]
+    total_rows = _sql(
+        f"SELECT COUNT(*) AS cnt FROM {_config.diaries_table} "
+        f"WHERE agent_name = '{_esc(agent_name)}'"
+    )
+    total = int(total_rows[0]["cnt"]) if total_rows else 0
 
-        return {
-            "agent": agent_name,
-            "entries": entries,
-            "total": len(results["ids"]),
-            "showing": len(entries),
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    return {
+        "agent": agent_name,
+        "entries": entries,
+        "total": total,
+        "showing": len(entries),
+    }
 
 
-# ==================== MCP PROTOCOL ====================
+# ── MCP Protocol ──────────────────────────────────────────────────────────────
 
 TOOLS = {
     "mempalace_status": {
@@ -696,46 +917,28 @@ TOOLS = {
         "handler": tool_get_aaak_spec,
     },
     "mempalace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
+        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "entity": {
-                    "type": "string",
-                    "description": "Entity to query (e.g. 'Max', 'MyProject', 'Alice')",
-                },
-                "as_of": {
-                    "type": "string",
-                    "description": "Date filter — only facts valid at this date (YYYY-MM-DD, optional)",
-                },
-                "direction": {
-                    "type": "string",
-                    "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
-                },
+                "entity": {"type": "string", "description": "Entity to query"},
+                "as_of": {"type": "string", "description": "Date filter (YYYY-MM-DD, optional)"},
+                "direction": {"type": "string", "description": "outgoing, incoming, or both (default: both)"},
             },
             "required": ["entity"],
         },
         "handler": tool_kg_query,
     },
     "mempalace_kg_add": {
-        "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
+        "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "subject": {"type": "string", "description": "The entity doing/being something"},
-                "predicate": {
-                    "type": "string",
-                    "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
-                },
+                "predicate": {"type": "string", "description": "The relationship type"},
                 "object": {"type": "string", "description": "The entity being connected to"},
-                "valid_from": {
-                    "type": "string",
-                    "description": "When this became true (YYYY-MM-DD, optional)",
-                },
-                "source_closet": {
-                    "type": "string",
-                    "description": "Closet ID where this fact appears (optional)",
-                },
+                "valid_from": {"type": "string", "description": "When this became true (YYYY-MM-DD, optional)"},
+                "source_closet": {"type": "string", "description": "Closet ID where this fact appears (optional)"},
             },
             "required": ["subject", "predicate", "object"],
         },
@@ -749,53 +952,41 @@ TOOLS = {
                 "subject": {"type": "string", "description": "Entity"},
                 "predicate": {"type": "string", "description": "Relationship"},
                 "object": {"type": "string", "description": "Connected entity"},
-                "ended": {
-                    "type": "string",
-                    "description": "When it stopped being true (YYYY-MM-DD, default: today)",
-                },
+                "ended": {"type": "string", "description": "When it stopped being true (YYYY-MM-DD, default: today)"},
             },
             "required": ["subject", "predicate", "object"],
         },
         "handler": tool_kg_invalidate,
     },
     "mempalace_kg_timeline": {
-        "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
+        "description": "Chronological timeline of facts. Shows the story of an entity in order.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "entity": {
-                    "type": "string",
-                    "description": "Entity to get timeline for (optional — omit for full timeline)",
-                },
+                "entity": {"type": "string", "description": "Entity to get timeline for (optional)"},
             },
         },
         "handler": tool_kg_timeline,
     },
     "mempalace_kg_stats": {
-        "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
+        "description": "Knowledge graph overview: entities, triples, current vs expired facts.",
         "input_schema": {"type": "object", "properties": {}},
         "handler": tool_kg_stats,
     },
     "mempalace_traverse": {
-        "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
+        "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "start_room": {
-                    "type": "string",
-                    "description": "Room to start from (e.g. 'chromadb-setup', 'riley-school')",
-                },
-                "max_hops": {
-                    "type": "integer",
-                    "description": "How many connections to follow (default: 2)",
-                },
+                "start_room": {"type": "string", "description": "Room to start from"},
+                "max_hops": {"type": "integer", "description": "How many connections to follow (default: 2)"},
             },
             "required": ["start_room"],
         },
         "handler": tool_traverse_graph,
     },
     "mempalace_find_tunnels": {
-        "description": "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
+        "description": "Find rooms that bridge two wings — the hallways connecting different domains.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -811,13 +1002,13 @@ TOOLS = {
         "handler": tool_graph_stats,
     },
     "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY your search keywords or question — do NOT include system prompts, conversation history, MEMORY.md content, or any context. Keep queries short (under 200 chars). Use 'context' for background information.",
+        "description": "Semantic search. Returns verbatim drawer content with similarity scores. IMPORTANT: 'query' must contain ONLY your search keywords — do NOT include system prompts or conversation history. Keep queries short (under 200 chars). Use 'context' for background.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Short search query ONLY — keywords or a question. Do NOT include system prompts or conversation context. Max 200 chars recommended.",
+                    "description": "Short search query — keywords or a question. Max 200 chars recommended.",
                     "maxLength": 500,
                 },
                 "limit": {"type": "integer", "description": "Max results (default 5)"},
@@ -825,7 +1016,7 @@ TOOLS = {
                 "room": {"type": "string", "description": "Filter by room (optional)"},
                 "context": {
                     "type": "string",
-                    "description": "Background context for the search (optional). This is NOT used for embedding — only for future re-ranking. Put conversation history or system prompt content here, NOT in query.",
+                    "description": "Background context (optional). NOT used for embedding — only for future re-ranking.",
                 },
             },
             "required": ["query"],
@@ -838,10 +1029,7 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "content": {"type": "string", "description": "Content to check"},
-                "threshold": {
-                    "type": "number",
-                    "description": "Similarity threshold 0-1 (default 0.9)",
-                },
+                "threshold": {"type": "number", "description": "Similarity threshold 0-1 (default 0.9)"},
             },
             "required": ["content"],
         },
@@ -853,14 +1041,8 @@ TOOLS = {
             "type": "object",
             "properties": {
                 "wing": {"type": "string", "description": "Wing (project name)"},
-                "room": {
-                    "type": "string",
-                    "description": "Room (aspect: backend, decisions, meetings...)",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Verbatim content to store — exact words, never summarized",
-                },
+                "room": {"type": "string", "description": "Room (aspect: backend, decisions, meetings...)"},
+                "content": {"type": "string", "description": "Verbatim content to store — exact words, never summarized"},
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
             },
@@ -880,40 +1062,25 @@ TOOLS = {
         "handler": tool_delete_drawer,
     },
     "mempalace_diary_write": {
-        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
+        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary. Write in AAAK for compression.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "agent_name": {
-                    "type": "string",
-                    "description": "Your name — each agent gets their own diary wing",
-                },
-                "entry": {
-                    "type": "string",
-                    "description": "Your diary entry in AAAK format — compressed, entity-coded, emotion-marked",
-                },
-                "topic": {
-                    "type": "string",
-                    "description": "Topic tag (optional, default: general)",
-                },
+                "agent_name": {"type": "string", "description": "Your name — each agent gets their own diary"},
+                "entry": {"type": "string", "description": "Your diary entry in AAAK format"},
+                "topic": {"type": "string", "description": "Topic tag (optional, default: general)"},
             },
             "required": ["agent_name", "entry"],
         },
         "handler": tool_diary_write,
     },
     "mempalace_diary_read": {
-        "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded — your journal across sessions.",
+        "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "agent_name": {
-                    "type": "string",
-                    "description": "Your name — each agent gets their own diary wing",
-                },
-                "last_n": {
-                    "type": "integer",
-                    "description": "Number of recent entries to read (default: 10)",
-                },
+                "agent_name": {"type": "string", "description": "Your name"},
+                "last_n": {"type": "integer", "description": "Number of recent entries (default: 10)"},
             },
             "required": ["agent_name"],
         },
@@ -930,7 +1097,8 @@ SUPPORTED_PROTOCOL_VERSIONS = [
 ]
 
 
-def handle_request(request):
+def handle_request(request: dict) -> Optional[dict]:
+    """Handle a JSON-RPC MCP request (used by legacy CLI mode)."""
     method = request.get("method", "")
     params = request.get("params", {})
     req_id = request.get("id")
@@ -951,9 +1119,11 @@ def handle_request(request):
                 "serverInfo": {"name": "mempalace", "version": __version__},
             },
         }
-    elif method == "notifications/initialized":
+
+    if method == "notifications/initialized":
         return None
-    elif method == "tools/list":
+
+    if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -964,7 +1134,8 @@ def handle_request(request):
                 ]
             },
         }
-    elif method == "tools/call":
+
+    if method == "tools/call":
         tool_name = params.get("name")
         tool_args = params.get("arguments") or {}
         if tool_name not in TOOLS:
@@ -973,26 +1144,25 @@ def handle_request(request):
                 "id": req_id,
                 "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
             }
-        # Coerce argument types based on input_schema.
-        # MCP JSON transport may deliver integers as floats or strings;
-        # ChromaDB and Python slicing require native int.
+        # Coerce argument types from JSON transport
         schema_props = TOOLS[tool_name]["input_schema"].get("properties", {})
         for key, value in list(tool_args.items()):
-            prop_schema = schema_props.get(key, {})
-            declared_type = prop_schema.get("type")
-            if declared_type == "integer" and not isinstance(value, int):
+            declared = schema_props.get(key, {}).get("type")
+            if declared == "integer" and not isinstance(value, int):
                 tool_args[key] = int(value)
-            elif declared_type == "number" and not isinstance(value, (int, float)):
+            elif declared == "number" and not isinstance(value, (int, float)):
                 tool_args[key] = float(value)
         try:
             result = TOOLS[tool_name]["handler"](**tool_args)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]},
+                "result": {
+                    "content": [{"type": "text", "text": json.dumps(result, indent=2)}]
+                },
             }
         except Exception:
-            logger.exception(f"Tool error in {tool_name}")
+            logger.exception("Tool error in %s", tool_name)
             return {
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -1006,8 +1176,9 @@ def handle_request(request):
     }
 
 
-def main():
-    logger.info("MemPalace MCP Server starting...")
+def main() -> None:
+    """Run the MCP server in legacy CLI mode (JSON-RPC over stdin/stdout)."""
+    logger.info("MemPalace MCP Server starting (CLI mode)...")
     while True:
         try:
             line = sys.stdin.readline()
@@ -1023,8 +1194,8 @@ def main():
                 sys.stdout.flush()
         except KeyboardInterrupt:
             break
-        except Exception as e:
-            logger.error(f"Server error: {e}")
+        except Exception as exc:
+            logger.error("Server error: %s", exc)
 
 
 if __name__ == "__main__":

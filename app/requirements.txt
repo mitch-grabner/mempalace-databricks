@@ -1,0 +1,6 @@
+# MemPalace MCP Server — Databricks App dependencies
+databricks-sdk>=0.40.0
+databricks-vectorsearch>=0.40
+mcp>=1.0.0
+uvicorn>=0.30.0
+pyyaml>=6.0,<7

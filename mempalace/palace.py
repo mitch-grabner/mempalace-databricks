@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from pyspark.sql import DataFrame, Row, SparkSession
@@ -180,7 +180,7 @@ def add_drawers(
         return 0
 
     spark = _get_spark()
-    now = datetime.utcnow().isoformat()
+    now = datetime.now(timezone.utc).isoformat()
 
     rows = []
     for d in drawers:
