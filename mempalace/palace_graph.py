@@ -1,6 +1,6 @@
 """
-palace_graph.py — Graph traversal layer for MemPalace
-======================================================
+palace_graph.py — Graph traversal layer for MemPalace (Databricks-native)
+==========================================================================
 
 Builds a navigable graph from the palace structure:
   - Nodes = rooms (named ideas)
@@ -12,79 +12,92 @@ Enables queries like:
   "Find all rooms connected to riley-college-apps"
   "What topics bridge wing_hardware and wing_myproject?"
 
-No external graph DB needed — built from ChromaDB metadata.
+No external graph DB needed — built from Delta table metadata via Spark SQL.
 """
 
-from collections import defaultdict, Counter
-from .config import MempalaceConfig
+from __future__ import annotations
 
-import chromadb
+from collections import Counter, defaultdict
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-
-def _get_collection(config=None):
-    config = config or MempalaceConfig()
-    try:
-        client = chromadb.PersistentClient(path=config.palace_path)
-        return client.get_collection(config.collection_name)
-    except Exception:
-        return None
+from .config import DatabricksConfig
+from .palace import _get_spark
 
 
-def build_graph(col=None, config=None):
-    """
-    Build the palace graph from ChromaDB metadata.
+# ── Graph construction ────────────────────────────────────────────────────────
+
+
+def build_graph(
+    config: Optional[DatabricksConfig] = None,
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
+    """Build the palace graph from Delta table metadata.
+
+    Replaces the original ChromaDB batch-iteration loop with a single
+    Spark SQL aggregation query — significantly faster at scale.
+
+    Args:
+        config: Databricks configuration. Uses defaults if not provided.
 
     Returns:
-        nodes: dict of {room: {wings: set, halls: set, count: int}}
-        edges: list of {room, wing_a, wing_b, hall} — one per tunnel crossing
+        Tuple of (nodes, edges) where:
+        - nodes: ``{room: {wings: list, halls: list, count: int, dates: list}}``
+        - edges: list of ``{room, wing_a, wing_b, hall, count}`` — one per tunnel crossing
     """
-    if col is None:
-        col = _get_collection(config)
-    if not col:
+    config = config or DatabricksConfig()
+
+    try:
+        spark = _get_spark()
+    except RuntimeError:
         return {}, []
 
-    total = col.count()
-    room_data = defaultdict(lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()})
+    # Single aggregation query replaces the Python batch loop
+    try:
+        rows = spark.sql(f"""
+            SELECT room, wing, hall, date, COUNT(*) AS cnt
+            FROM {config.drawers_table}
+            WHERE room IS NOT NULL
+              AND room != 'general'
+              AND wing IS NOT NULL
+            GROUP BY room, wing, hall, date
+        """).collect()
+    except Exception:
+        return {}, []
 
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=1000, offset=offset, include=["metadatas"])
-        for meta in batch["metadatas"]:
-            room = meta.get("room", "")
-            wing = meta.get("wing", "")
-            hall = meta.get("hall", "")
-            date = meta.get("date", "")
-            if room and room != "general" and wing:
-                room_data[room]["wings"].add(wing)
-                if hall:
-                    room_data[room]["halls"].add(hall)
-                if date:
-                    room_data[room]["dates"].add(date)
-                room_data[room]["count"] += 1
-        if not batch["ids"]:
-            break
-        offset += len(batch["ids"])
+    if not rows:
+        return {}, []
+
+    # Aggregate into room_data (mirrors the original defaultdict structure)
+    room_data: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"wings": set(), "halls": set(), "count": 0, "dates": set()}
+    )
+    for row in rows:
+        room = row["room"]
+        rd = room_data[room]
+        rd["wings"].add(row["wing"])
+        if row["hall"]:
+            rd["halls"].add(row["hall"])
+        if row["date"]:
+            rd["dates"].add(row["date"])
+        rd["count"] += row["cnt"]
 
     # Build edges from rooms that span multiple wings
-    edges = []
+    edges: List[Dict[str, Any]] = []
     for room, data in room_data.items():
         wings = sorted(data["wings"])
         if len(wings) >= 2:
             for i, wa in enumerate(wings):
-                for wb in wings[i + 1 :]:
+                for wb in wings[i + 1:]:
                     for hall in data["halls"]:
-                        edges.append(
-                            {
-                                "room": room,
-                                "wing_a": wa,
-                                "wing_b": wb,
-                                "hall": hall,
-                                "count": data["count"],
-                            }
-                        )
+                        edges.append({
+                            "room": room,
+                            "wing_a": wa,
+                            "wing_b": wb,
+                            "hall": hall,
+                            "count": data["count"],
+                        })
 
-    # Convert sets to lists for JSON serialization
-    nodes = {}
+    # Convert sets to sorted lists for JSON serialization
+    nodes: Dict[str, Dict[str, Any]] = {}
     for room, data in room_data.items():
         nodes[room] = {
             "wings": sorted(data["wings"]),
@@ -96,14 +109,27 @@ def build_graph(col=None, config=None):
     return nodes, edges
 
 
-def traverse(start_room: str, col=None, config=None, max_hops: int = 2):
-    """
-    Walk the graph from a starting room. Find connected rooms
-    through shared wings.
+# ── Traversal ─────────────────────────────────────────────────────────────────
 
-    Returns list of paths: [{room, wing, hall, hop_distance}]
+
+def traverse(
+    start_room: str,
+    config: Optional[DatabricksConfig] = None,
+    max_hops: int = 2,
+) -> Union[List[Dict[str, Any]], Dict[str, Any]]:
+    """Walk the graph from a starting room via shared wings (BFS).
+
+    Args:
+        start_room: Room slug to start from.
+        config: Databricks configuration.
+        max_hops: Maximum BFS depth (default 2).
+
+    Returns:
+        List of path dicts ``{room, wings, halls, count, hop, connected_via}``,
+        sorted by (hop, -count). On error, returns a dict with ``error`` and
+        ``suggestions`` keys.
     """
-    nodes, edges = build_graph(col, config)
+    nodes, edges = build_graph(config)
 
     if start_room not in nodes:
         return {
@@ -113,7 +139,7 @@ def traverse(start_room: str, col=None, config=None, max_hops: int = 2):
 
     start = nodes[start_room]
     visited = {start_room}
-    results = [
+    results: List[Dict[str, Any]] = [
         {
             "room": start_room,
             "wings": start["wings"],
@@ -124,7 +150,7 @@ def traverse(start_room: str, col=None, config=None, max_hops: int = 2):
     ]
 
     # BFS traversal
-    frontier = [(start_room, 0)]
+    frontier: List[Tuple[str, int]] = [(start_room, 0)]
     while frontier:
         current_room, depth = frontier.pop(0)
         if depth >= max_hops:
@@ -140,62 +166,87 @@ def traverse(start_room: str, col=None, config=None, max_hops: int = 2):
             shared_wings = current_wings & set(data["wings"])
             if shared_wings:
                 visited.add(room)
-                results.append(
-                    {
-                        "room": room,
-                        "wings": data["wings"],
-                        "halls": data["halls"],
-                        "count": data["count"],
-                        "hop": depth + 1,
-                        "connected_via": sorted(shared_wings),
-                    }
-                )
+                results.append({
+                    "room": room,
+                    "wings": data["wings"],
+                    "halls": data["halls"],
+                    "count": data["count"],
+                    "hop": depth + 1,
+                    "connected_via": sorted(shared_wings),
+                })
                 if depth + 1 < max_hops:
                     frontier.append((room, depth + 1))
 
-    # Sort by relevance (hop distance, then count)
+    # Sort by relevance (hop distance, then count descending)
     results.sort(key=lambda x: (x["hop"], -x["count"]))
-    return results[:50]  # cap results
+    return results[:50]
 
 
-def find_tunnels(wing_a: str = None, wing_b: str = None, col=None, config=None):
+# ── Tunnel discovery ──────────────────────────────────────────────────────────
+
+
+def find_tunnels(
+    wing_a: Optional[str] = None,
+    wing_b: Optional[str] = None,
+    config: Optional[DatabricksConfig] = None,
+) -> List[Dict[str, Any]]:
+    """Find rooms that connect two wings (or all tunnel rooms).
+
+    Tunnels are rooms with the same slug appearing in multiple wings — the
+    cross-domain bridges of the palace.
+
+    Args:
+        wing_a: Optional first wing filter.
+        wing_b: Optional second wing filter.
+        config: Databricks configuration.
+
+    Returns:
+        List of tunnel dicts ``{room, wings, halls, count, recent}``,
+        sorted by count descending. Capped at 50 results.
     """
-    Find rooms that connect two wings (or all tunnel rooms if no wings specified).
-    These are the "hallways" — same named idea appearing in multiple domains.
-    """
-    nodes, edges = build_graph(col, config)
+    nodes, _edges = build_graph(config)
 
-    tunnels = []
+    tunnels: List[Dict[str, Any]] = []
     for room, data in nodes.items():
         wings = data["wings"]
         if len(wings) < 2:
             continue
-
         if wing_a and wing_a not in wings:
             continue
         if wing_b and wing_b not in wings:
             continue
 
-        tunnels.append(
-            {
-                "room": room,
-                "wings": wings,
-                "halls": data["halls"],
-                "count": data["count"],
-                "recent": data["dates"][-1] if data["dates"] else "",
-            }
-        )
+        tunnels.append({
+            "room": room,
+            "wings": wings,
+            "halls": data["halls"],
+            "count": data["count"],
+            "recent": data["dates"][-1] if data["dates"] else "",
+        })
 
     tunnels.sort(key=lambda x: -x["count"])
     return tunnels[:50]
 
 
-def graph_stats(col=None, config=None):
-    """Summary statistics about the palace graph."""
-    nodes, edges = build_graph(col, config)
+# ── Statistics ────────────────────────────────────────────────────────────────
+
+
+def graph_stats(
+    config: Optional[DatabricksConfig] = None,
+) -> Dict[str, Any]:
+    """Summary statistics about the palace graph.
+
+    Args:
+        config: Databricks configuration.
+
+    Returns:
+        Dict with total_rooms, tunnel_rooms, total_edges,
+        rooms_per_wing, and top_tunnels.
+    """
+    nodes, edges = build_graph(config)
 
     tunnel_rooms = sum(1 for n in nodes.values() if len(n["wings"]) >= 2)
-    wing_counts = Counter()
+    wing_counts: Counter = Counter()
     for data in nodes.values():
         for w in data["wings"]:
             wing_counts[w] += 1
@@ -213,12 +264,23 @@ def graph_stats(col=None, config=None):
     }
 
 
-def _fuzzy_match(query: str, nodes: dict, n: int = 5):
-    """Find rooms that approximately match a query string."""
+# ── Fuzzy matching (backend-agnostic) ─────────────────────────────────────────
+
+
+def _fuzzy_match(query: str, nodes: Dict[str, Any], n: int = 5) -> List[str]:
+    """Find rooms that approximately match a query string.
+
+    Args:
+        query: Room slug or partial name to search for.
+        nodes: The nodes dict from ``build_graph()``.
+        n: Maximum number of suggestions to return.
+
+    Returns:
+        List of room slugs ranked by match quality.
+    """
     query_lower = query.lower()
-    scored = []
+    scored: List[Tuple[str, float]] = []
     for room in nodes:
-        # Simple substring matching
         if query_lower in room:
             scored.append((room, 1.0))
         elif any(word in room for word in query_lower.split("-")):
