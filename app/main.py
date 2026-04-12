@@ -24,14 +24,22 @@ if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
+from starlette.middleware.cors import CORSMiddleware  # noqa: E402
 
 from mempalace.mcp_server import TOOLS  # noqa: E402
 
 # ── Build FastMCP server ──────────────────────────────────────────────────────
+# Disable DNS rebinding protection — the app is behind Databricks OAuth proxy
+# which handles auth. Genie Code and AI Playground send cross-origin requests
+# from the workspace domain that would be blocked by default.
 
 mcp = FastMCP(
     "mempalace",
     stateless_http=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=False,
+    ),
 )
 
 
@@ -46,8 +54,19 @@ def _register_tools() -> None:
 _register_tools()
 
 # ── ASGI app for Databricks App runtime ───────────────────────────────────────
+# Genie Code and AI Playground make cross-origin requests to the app.
+# CORS middleware is required for Databricks-hosted MCP clients.
+# The app is already behind Databricks OAuth — allow all origins.
 
 app = mcp.streamable_http_app()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 if __name__ == "__main__":
     import uvicorn
