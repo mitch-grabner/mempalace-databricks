@@ -42,6 +42,7 @@ Tools (agent diary):
 """
 
 import hashlib
+import time as _time
 import json
 import logging
 import os
@@ -67,6 +68,8 @@ _config = DatabricksConfig()
 
 _ws_client = None
 _vs_client = None
+_vs_client_created_at: float = 0.0
+_VS_TOKEN_TTL_SECONDS: float = 45 * 60  # Refresh token every 45 min (tokens expire ~1hr)
 
 
 def _get_ws() -> "WorkspaceClient":
@@ -78,23 +81,42 @@ def _get_ws() -> "WorkspaceClient":
     return _ws_client
 
 
+def _build_vsc() -> "VectorSearchClient":
+    """Create a fresh ``VectorSearchClient`` with a current bearer token."""
+    from databricks.vector_search.client import VectorSearchClient
+
+    ws = _get_ws()
+    header_factory = ws.config.authenticate()
+    headers = header_factory() if callable(header_factory) else header_factory
+    token = (headers.get("Authorization") or "").removeprefix("Bearer ")
+    return VectorSearchClient(
+        workspace_url=ws.config.host,
+        personal_access_token=token,
+        disable_notice=True,
+    )
+
+
+def _invalidate_vsc() -> None:
+    """Force the next ``_get_vsc()`` call to create a fresh client."""
+    global _vs_client, _vs_client_created_at
+    _vs_client = None
+    _vs_client_created_at = 0.0
+    logger.info("VS client invalidated — will refresh on next call.")
+
+
 def _get_vsc() -> "VectorSearchClient":
-    """Return a cached ``VectorSearchClient``."""
-    global _vs_client
-    if _vs_client is None:
-        from databricks.vector_search.client import VectorSearchClient
-        # VectorSearchClient doesn't auto-discover Databricks App SP
-        # credentials, and older versions lack workspace_client kwarg.
-        # Extract auth from the SDK's WorkspaceClient instead.
-        ws = _get_ws()
-        header_factory = ws.config.authenticate()
-        headers = header_factory() if callable(header_factory) else header_factory
-        token = (headers.get("Authorization") or "").removeprefix("Bearer ")
-        _vs_client = VectorSearchClient(
-            workspace_url=ws.config.host,
-            personal_access_token=token,
-            disable_notice=True,
-        )
+    """Return a ``VectorSearchClient``, refreshing when the token is stale.
+
+    The client is cached for ``_VS_TOKEN_TTL_SECONDS`` (default 45 min).
+    After that window the bearer token extracted from the WorkspaceClient
+    is re-fetched, because Databricks App SP tokens expire after ~1 hour.
+    """
+    global _vs_client, _vs_client_created_at
+    now = _time.monotonic()
+    if _vs_client is None or (now - _vs_client_created_at) > _VS_TOKEN_TTL_SECONDS:
+        _vs_client = _build_vsc()
+        _vs_client_created_at = now
+        logger.info("VS client (re)created with fresh token.")
     return _vs_client
 
 
@@ -155,23 +177,37 @@ def _vs_search(
     num_results: int = 5,
     filters: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run a hybrid similarity search and return row-dicts with a ``score`` key."""
-    index = _get_vsc().get_index(
-        endpoint_name=_config.vs_endpoint,
-        index_name=_config.vs_index_name,
-    )
-    resp = index.similarity_search(
-        query_text=query_text,
-        columns=columns,
-        num_results=num_results,
-        filters=filters,
-        query_type="hybrid",
-    )
-    col_names = [c["name"] for c in resp.get("manifest", {}).get("columns", [])]
-    rows: List[Dict[str, Any]] = []
-    for row in resp.get("result", {}).get("data_array", []):
-        rows.append(dict(zip(col_names, row)))
-    return rows
+    """Run a hybrid similarity search and return row-dicts with a ``score`` key.
+
+    Automatically retries once with a fresh token if the first attempt
+    fails with an authentication/token error.
+    """
+    for attempt in range(2):
+        try:
+            index = _get_vsc().get_index(
+                endpoint_name=_config.vs_endpoint,
+                index_name=_config.vs_index_name,
+            )
+            resp = index.similarity_search(
+                query_text=query_text,
+                columns=columns,
+                num_results=num_results,
+                filters=filters,
+                query_type="hybrid",
+            )
+            col_names = [c["name"] for c in resp.get("manifest", {}).get("columns", [])]
+            rows: List[Dict[str, Any]] = []
+            for row in resp.get("result", {}).get("data_array", []):
+                rows.append(dict(zip(col_names, row)))
+            return rows
+        except Exception as exc:
+            err_str = str(exc).lower()
+            if attempt == 0 and ("token" in err_str or "401" in err_str or "auth" in err_str):
+                logger.warning("VS search token error — refreshing client and retrying: %s", exc)
+                _invalidate_vsc()
+                continue
+            raise
+    return []  # unreachable, but keeps mypy happy
 
 
 # ── Write-Ahead Log ───────────────────────────────────────────────────────────
