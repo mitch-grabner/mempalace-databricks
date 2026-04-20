@@ -42,6 +42,7 @@ Tools (agent diary):
 """
 
 import hashlib
+import threading
 import time as _time
 import json
 import logging
@@ -143,11 +144,14 @@ def _sql(query: str) -> List[Dict[str, Optional[str]]]:
     """
     from databricks.sdk.service.sql import StatementState
 
+    _t0 = _time.perf_counter()
     resp = _get_ws().statement_execution.execute_statement(
         warehouse_id=_warehouse_id(),
         statement=query,
         wait_timeout="30s",
     )
+    _elapsed = (_time.perf_counter() - _t0) * 1000
+    logger.info("SQL %.0fms: %s", _elapsed, query[:80].replace(chr(10), " "))
     if resp.status and resp.status.state == StatementState.FAILED:
         msg = resp.status.error.message if resp.status.error else "Unknown SQL error"
         raise RuntimeError(f"SQL failed: {msg}")
@@ -182,6 +186,7 @@ def _vs_search(
     Automatically retries once with a fresh token if the first attempt
     fails with an authentication/token error.
     """
+    _t0 = _time.perf_counter()
     for attempt in range(2):
         try:
             index = _get_vsc().get_index(
@@ -199,6 +204,8 @@ def _vs_search(
             rows: List[Dict[str, Any]] = []
             for row in resp.get("result", {}).get("data_array", []):
                 rows.append(dict(zip(col_names, row)))
+            _elapsed = (_time.perf_counter() - _t0) * 1000
+            logger.info("VS search %.0fms: %d hits for '%s'", _elapsed, len(rows), query_text[:50])
             return rows
         except Exception as exc:
             err_str = str(exc).lower()
@@ -214,19 +221,26 @@ def _vs_search(
 
 
 def _wal_log(operation: str, params: dict, result: Optional[dict] = None) -> None:
-    """Append an audit entry to the WAL Delta table."""
-    now = datetime.now(timezone.utc).isoformat()
-    try:
-        _sql(f"""
-            INSERT INTO {_config.wal_table}
-            (timestamp, operation, params, result, caller)
-            VALUES ('{now}', '{_esc(operation)}',
-                    '{_esc(json.dumps(params, default=str))}',
-                    '{_esc(json.dumps(result, default=str) if result else "")}',
-                    current_user())
-        """)
-    except Exception as exc:
-        logger.error("WAL write failed: %s", exc)
+    """Append an audit entry to the WAL Delta table (non-blocking).
+
+    Runs in a daemon thread to avoid blocking tool handlers.
+    WAL failures are logged but never propagate to the caller.
+    """
+    def _write():
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            _sql(f"""
+                INSERT INTO {_config.wal_table}
+                (timestamp, operation, params, result, caller)
+                VALUES ('{now}', '{_esc(operation)}',
+                        '{_esc(json.dumps(params, default=str))}',
+                        '{_esc(json.dumps(result, default=str) if result else "")}',
+                        current_user())
+            """)
+        except Exception as exc:
+            logger.error("WAL write failed: %s", exc)
+
+    threading.Thread(target=_write, daemon=True).start()
 
 
 def _no_palace() -> dict:

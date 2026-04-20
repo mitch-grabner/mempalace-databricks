@@ -14,7 +14,9 @@ Because uvicorn runs from the project root, ``mempalace.*`` is
 importable without any sys.path manipulation.
 """
 
+import logging
 import sys
+import time
 from pathlib import Path
 
 # Safety net: if someone runs ``python app/main.py`` directly, the
@@ -25,9 +27,48 @@ if _project_root not in sys.path:
 
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.server.transport_security import TransportSecuritySettings  # noqa: E402
+from starlette.middleware import Middleware  # noqa: E402
 from starlette.middleware.cors import CORSMiddleware  # noqa: E402
+from starlette.requests import Request  # noqa: E402
+from starlette.responses import Response  # noqa: E402
+from starlette.types import ASGIApp, Receive, Scope, Send  # noqa: E402
 
 from mempalace.mcp_server import TOOLS  # noqa: E402
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("mempalace_app")
+
+
+# ── Request timing middleware ─────────────────────────────────────────────────
+
+
+class TimingMiddleware:
+    """Log wall-clock latency of every ASGI request."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        t0 = time.perf_counter()
+        path = scope.get("path", "?")
+
+        async def timed_send(message):
+            if message["type"] == "http.response.start":
+                elapsed_ms = (time.perf_counter() - t0) * 1000
+                status = message.get("status", "?")
+                logger.info("REQ %s → %s in %.0fms", path, status, elapsed_ms)
+            await send(message)
+
+        await self.app(scope, receive, timed_send)
+
 
 # ── Build FastMCP server ──────────────────────────────────────────────────────
 # Disable DNS rebinding protection — the app is behind Databricks OAuth proxy
@@ -60,6 +101,7 @@ _register_tools()
 
 app = mcp.streamable_http_app()
 
+app.add_middleware(TimingMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -67,6 +109,62 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ── Startup: pre-warm SQL warehouse connection ───────────────────────────────
+
+_WARM_DONE = False
+
+
+async def _lifespan_prewarm(app: ASGIApp):
+    """Fire a lightweight SQL query on startup to warm the warehouse."""
+    global _WARM_DONE
+    if not _WARM_DONE:
+        try:
+            from mempalace.mcp_server import _sql
+            logger.info("Pre-warming SQL warehouse connection...")
+            t0 = time.perf_counter()
+            _sql("SELECT 1")
+            elapsed = (time.perf_counter() - t0) * 1000
+            logger.info("SQL warehouse warm in %.0fms", elapsed)
+        except Exception as exc:
+            logger.warning("Pre-warm failed (non-fatal): %s", exc)
+        _WARM_DONE = True
+    yield
+
+
+# Note: Starlette's lifespan requires passing at app construction time.
+# Since mcp.streamable_http_app() doesn't expose lifespan, we pre-warm
+# on first request instead via a one-shot middleware.
+
+
+class PreWarmMiddleware:
+    """One-shot middleware: pre-warms SQL warehouse on the first request."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+        self._warmed = False
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not self._warmed and scope["type"] == "http":
+            self._warmed = True
+            try:
+                import asyncio
+                from mempalace.mcp_server import _sql
+
+                loop = asyncio.get_event_loop()
+                logger.info("First request — pre-warming SQL warehouse...")
+                t0 = time.perf_counter()
+                await loop.run_in_executor(None, _sql, "SELECT 1")
+                elapsed = (time.perf_counter() - t0) * 1000
+                logger.info("SQL warehouse warm in %.0fms", elapsed)
+            except Exception as exc:
+                logger.warning("Pre-warm failed (non-fatal): %s", exc)
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(PreWarmMiddleware)
+
 
 if __name__ == "__main__":
     import uvicorn
