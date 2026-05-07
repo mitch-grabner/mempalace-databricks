@@ -243,6 +243,40 @@ def _wal_log(operation: str, params: dict, result: Optional[dict] = None) -> Non
     threading.Thread(target=_write, daemon=True).start()
 
 
+# ── Vector Search Index Sync ──────────────────────────────────────────────────
+
+_vs_sync_lock = threading.Lock()
+_vs_last_sync: float = 0.0
+_VS_SYNC_DEBOUNCE_SECONDS: float = 60.0  # Min interval between sync triggers
+
+
+def _trigger_vs_sync() -> None:
+    """Trigger a Vector Search index sync after a drawer write/delete.
+
+    Debounced: at most one sync per ``_VS_SYNC_DEBOUNCE_SECONDS``.
+    Runs in a daemon thread to avoid blocking tool handlers.
+    Sync failures are logged but never propagate to the caller.
+    """
+    global _vs_last_sync
+    with _vs_sync_lock:
+        now = _time.monotonic()
+        if (now - _vs_last_sync) < _VS_SYNC_DEBOUNCE_SECONDS:
+            logger.debug("VS sync debounced (last sync %.0fs ago).", now - _vs_last_sync)
+            return
+        _vs_last_sync = now
+
+    def _sync():
+        try:
+            _get_ws().vector_search_indexes.sync_index(
+                index_name=_config.vs_index_name,
+            )
+            logger.info("VS index sync triggered for %s.", _config.vs_index_name)
+        except Exception as exc:
+            logger.warning("VS index sync failed (non-fatal): %s", exc)
+
+    threading.Thread(target=_sync, daemon=True).start()
+
+
 def _no_palace() -> dict:
     """Standard error when tables are not reachable."""
     return {
@@ -494,6 +528,7 @@ def tool_add_drawer(
                     '{_esc(source_file or "")}', 0, 3.0, '{_esc(added_by)}', '{now}')
         """)
         logger.info("Filed drawer: %s → %s/%s", drawer_id, wing, room)
+        _trigger_vs_sync()
         return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
@@ -521,6 +556,7 @@ def tool_delete_drawer(drawer_id: str) -> dict:
     try:
         _sql(f"DELETE FROM {_config.drawers_table} WHERE id = '{_esc(drawer_id)}'")
         logger.info("Deleted drawer: %s", drawer_id)
+        _trigger_vs_sync()
         return {"success": True, "drawer_id": drawer_id}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
