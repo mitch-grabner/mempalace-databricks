@@ -23,6 +23,9 @@ logger = logging.getLogger("mempalace_mcp")
 VS_TOKEN_TTL_SECONDS = 45 * 60
 VS_SYNC_DEBOUNCE_SECONDS = 60.0
 INSERT_BATCH_SIZE = 100
+SQL_INITIAL_WAIT_TIMEOUT = "30s"
+SQL_POLL_TIMEOUT_SECONDS = 180.0
+SQL_POLL_INTERVAL_SECONDS = 2.0
 
 
 def sql_escape(value: Any) -> str:
@@ -97,10 +100,7 @@ class DatabricksBackend:
     def vector_search_client(self):
         """Return a cached Vector Search client with token refresh."""
         now = time.monotonic()
-        if (
-            self._vs_client is None
-            or (now - self._vs_client_created_at) > VS_TOKEN_TTL_SECONDS
-        ):
+        if self._vs_client is None or (now - self._vs_client_created_at) > VS_TOKEN_TTL_SECONDS:
             self._vs_client = self._build_vector_search_client()
             self._vs_client_created_at = now
             logger.info("VS client (re)created with fresh token.")
@@ -119,21 +119,43 @@ class DatabricksBackend:
 
     def sql(self, query: str) -> List[Dict[str, Optional[str]]]:
         """Execute a Databricks SQL statement and return row dictionaries."""
-        from databricks.sdk.service.sql import StatementState
+        from databricks.sdk.service.sql import ExecuteStatementRequestOnWaitTimeout, StatementState
 
         t0 = time.perf_counter()
         with redirect_stdout(sys.stderr):
             resp = self.workspace_client().statement_execution.execute_statement(
                 warehouse_id=self.warehouse_id(),
                 statement=query,
-                wait_timeout="30s",
+                wait_timeout=SQL_INITIAL_WAIT_TIMEOUT,
+                on_wait_timeout=ExecuteStatementRequestOnWaitTimeout.CONTINUE,
             )
+
+            statement_id = getattr(resp, "statement_id", None)
+            while resp.status and resp.status.state in {
+                StatementState.PENDING,
+                StatementState.RUNNING,
+            }:
+                if (time.perf_counter() - t0) > SQL_POLL_TIMEOUT_SECONDS:
+                    if statement_id:
+                        self.workspace_client().statement_execution.cancel_execution(statement_id)
+                    raise TimeoutError(
+                        "Databricks SQL statement did not complete within "
+                        f"{SQL_POLL_TIMEOUT_SECONDS:.0f}s"
+                    )
+                if not statement_id:
+                    raise RuntimeError("Databricks SQL statement is running without an ID")
+                time.sleep(SQL_POLL_INTERVAL_SECONDS)
+                resp = self.workspace_client().statement_execution.get_statement(statement_id)
+
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info("SQL %.0fms: %s", elapsed, query[:80].replace(chr(10), " "))
 
         if resp.status and resp.status.state == StatementState.FAILED:
             msg = resp.status.error.message if resp.status.error else "Unknown SQL error"
             raise RuntimeError(f"SQL failed: {msg}")
+
+        if resp.status and resp.status.state != StatementState.SUCCEEDED:
+            raise RuntimeError(f"SQL ended in unexpected state: {resp.status.state}")
 
         if not resp.manifest or not resp.result or not resp.result.data_array:
             return []
@@ -167,9 +189,7 @@ class DatabricksBackend:
                         filters=filters,
                         query_type=query_type,
                     )
-                col_names = [
-                    c["name"] for c in resp.get("manifest", {}).get("columns", [])
-                ]
+                col_names = [c["name"] for c in resp.get("manifest", {}).get("columns", [])]
                 if not col_names:
                     col_names = resp.get("result", {}).get("column_names", [])
                 rows = [
@@ -186,9 +206,7 @@ class DatabricksBackend:
                 return rows
             except Exception as exc:
                 err_str = str(exc).lower()
-                if attempt == 0 and (
-                    "token" in err_str or "401" in err_str or "auth" in err_str
-                ):
+                if attempt == 0 and ("token" in err_str or "401" in err_str or "auth" in err_str):
                     logger.warning("VS search token error — refreshing client: %s", exc)
                     self.invalidate_vector_search_client()
                     continue
@@ -325,6 +343,4 @@ class DatabricksBackend:
 
     def delete_drawer(self, drawer_id: str) -> None:
         """Delete one drawer by ID."""
-        self.sql(
-            f"DELETE FROM {self.config.drawers_table} WHERE id = '{sql_escape(drawer_id)}'"
-        )
+        self.sql(f"DELETE FROM {self.config.drawers_table} WHERE id = '{sql_escape(drawer_id)}'")
