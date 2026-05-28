@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import sys
-import threading
 import time
 from contextlib import redirect_stdout
 from datetime import datetime, timezone
@@ -58,7 +57,6 @@ class DatabricksBackend:
         self._ws_client = None
         self._vs_client = None
         self._vs_client_created_at = 0.0
-        self._vs_sync_lock = threading.Lock()
         self._vs_last_sync = 0.0
 
     # ── SDK clients ──────────────────────────────────────────────────────
@@ -198,45 +196,47 @@ class DatabricksBackend:
         return []
 
     def trigger_vector_sync(self) -> None:
-        """Trigger Delta Sync index refresh in a daemon thread."""
-        with self._vs_sync_lock:
-            now = time.monotonic()
-            if (now - self._vs_last_sync) < VS_SYNC_DEBOUNCE_SECONDS:
-                logger.debug("VS sync debounced (last sync %.0fs ago).", now - self._vs_last_sync)
-                return
-            self._vs_last_sync = now
+        """Trigger Delta Sync index refresh.
 
-        def _sync() -> None:
-            try:
-                with redirect_stdout(sys.stderr):
-                    self.workspace_client().vector_search_indexes.sync_index(
-                        index_name=self.config.vs_index_name,
-                    )
-                logger.info("VS index sync triggered for %s.", self.config.vs_index_name)
-            except Exception as exc:
-                logger.warning("VS index sync failed (non-fatal): %s", exc)
+        This intentionally runs synchronously. ``redirect_stdout`` is
+        process-wide, so using it inside background threads can redirect the
+        MCP JSON-RPC response to stderr and break stdio transports.
+        """
+        now = time.monotonic()
+        if (now - self._vs_last_sync) < VS_SYNC_DEBOUNCE_SECONDS:
+            logger.debug("VS sync debounced (last sync %.0fs ago).", now - self._vs_last_sync)
+            return
+        self._vs_last_sync = now
 
-        threading.Thread(target=_sync, daemon=True).start()
+        try:
+            with redirect_stdout(sys.stderr):
+                self.workspace_client().vector_search_indexes.sync_index(
+                    index_name=self.config.vs_index_name,
+                )
+            logger.info("VS index sync triggered for %s.", self.config.vs_index_name)
+        except Exception as exc:
+            logger.warning("VS index sync failed (non-fatal): %s", exc)
 
     # ── Shared table operations ──────────────────────────────────────────
 
     def wal_log(self, operation: str, params: dict, result: Optional[dict] = None) -> None:
-        """Append an audit entry to the WAL table in a daemon thread."""
-        def _write() -> None:
-            now = datetime.now(timezone.utc).isoformat()
-            try:
-                self.sql(f"""
-                    INSERT INTO {self.config.wal_table}
-                    (timestamp, operation, params, result, caller)
-                    VALUES ('{now}', '{sql_escape(operation)}',
-                            '{sql_escape(json.dumps(params, default=str))}',
-                            '{sql_escape(json.dumps(result, default=str) if result else "")}',
-                            current_user())
-                """)
-            except Exception as exc:
-                logger.error("WAL write failed: %s", exc)
+        """Append an audit entry to the WAL table.
 
-        threading.Thread(target=_write, daemon=True).start()
+        This is synchronous for stdio safety. Background threads cannot safely
+        use ``redirect_stdout`` because it mutates process-global stdout.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            self.sql(f"""
+                INSERT INTO {self.config.wal_table}
+                (timestamp, operation, params, result, caller)
+                VALUES ('{now}', '{sql_escape(operation)}',
+                        '{sql_escape(json.dumps(params, default=str))}',
+                        '{sql_escape(json.dumps(result, default=str) if result else "")}',
+                        current_user())
+            """)
+        except Exception as exc:
+            logger.error("WAL write failed: %s", exc)
 
     def file_already_mined(self, source_file: str, check_mtime: bool = False) -> bool:
         """Return whether a source file has already been filed."""

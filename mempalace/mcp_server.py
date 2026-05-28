@@ -164,11 +164,7 @@ def _vs_search(
 
 
 def _wal_log(operation: str, params: dict, result: Optional[dict] = None) -> None:
-    """Append an audit entry to the WAL Delta table (non-blocking).
-
-    Runs in a daemon thread to avoid blocking tool handlers.
-    WAL failures are logged but never propagate to the caller.
-    """
+    """Append an audit entry to the WAL Delta table."""
     _get_backend().wal_log(operation, params, result)
 
 
@@ -178,7 +174,6 @@ def _trigger_vs_sync() -> None:
     """Trigger a Vector Search index sync after a drawer write/delete.
 
     Debounced: at most one sync per ``_VS_SYNC_DEBOUNCE_SECONDS``.
-    Runs in a daemon thread to avoid blocking tool handlers.
     Sync failures are logged but never propagate to the caller.
     """
     _get_backend().trigger_vector_sync()
