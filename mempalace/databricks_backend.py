@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import threading
 import time
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -66,25 +68,27 @@ class DatabricksBackend:
         if self._ws_client is None:
             from databricks.sdk import WorkspaceClient
 
-            if self.config.databricks_profile:
-                self._ws_client = WorkspaceClient(profile=self.config.databricks_profile)
-            else:
-                self._ws_client = WorkspaceClient()
+            with redirect_stdout(sys.stderr):
+                if self.config.databricks_profile:
+                    self._ws_client = WorkspaceClient(profile=self.config.databricks_profile)
+                else:
+                    self._ws_client = WorkspaceClient()
         return self._ws_client
 
     def _build_vector_search_client(self):
         """Create a fresh VectorSearchClient with a current bearer token."""
         from databricks.vector_search.client import VectorSearchClient
 
-        ws = self.workspace_client()
-        header_factory = ws.config.authenticate()
-        headers = header_factory() if callable(header_factory) else header_factory
-        token = (headers.get("Authorization") or "").removeprefix("Bearer ")
-        return VectorSearchClient(
-            workspace_url=ws.config.host,
-            personal_access_token=token,
-            disable_notice=True,
-        )
+        with redirect_stdout(sys.stderr):
+            ws = self.workspace_client()
+            header_factory = ws.config.authenticate()
+            headers = header_factory() if callable(header_factory) else header_factory
+            token = (headers.get("Authorization") or "").removeprefix("Bearer ")
+            return VectorSearchClient(
+                workspace_url=ws.config.host,
+                personal_access_token=token,
+                disable_notice=True,
+            )
 
     def invalidate_vector_search_client(self) -> None:
         """Force the next Vector Search call to refresh auth."""
@@ -120,11 +124,12 @@ class DatabricksBackend:
         from databricks.sdk.service.sql import StatementState
 
         t0 = time.perf_counter()
-        resp = self.workspace_client().statement_execution.execute_statement(
-            warehouse_id=self.warehouse_id(),
-            statement=query,
-            wait_timeout="30s",
-        )
+        with redirect_stdout(sys.stderr):
+            resp = self.workspace_client().statement_execution.execute_statement(
+                warehouse_id=self.warehouse_id(),
+                statement=query,
+                wait_timeout="30s",
+            )
         elapsed = (time.perf_counter() - t0) * 1000
         logger.info("SQL %.0fms: %s", elapsed, query[:80].replace(chr(10), " "))
 
@@ -152,17 +157,18 @@ class DatabricksBackend:
         t0 = time.perf_counter()
         for attempt in range(2):
             try:
-                index = self.vector_search_client().get_index(
-                    endpoint_name=self.config.vs_endpoint,
-                    index_name=self.config.vs_index_name,
-                )
-                resp = index.similarity_search(
-                    query_text=query_text,
-                    columns=columns,
-                    num_results=num_results,
-                    filters=filters,
-                    query_type=query_type,
-                )
+                with redirect_stdout(sys.stderr):
+                    index = self.vector_search_client().get_index(
+                        endpoint_name=self.config.vs_endpoint,
+                        index_name=self.config.vs_index_name,
+                    )
+                    resp = index.similarity_search(
+                        query_text=query_text,
+                        columns=columns,
+                        num_results=num_results,
+                        filters=filters,
+                        query_type=query_type,
+                    )
                 col_names = [
                     c["name"] for c in resp.get("manifest", {}).get("columns", [])
                 ]
@@ -202,9 +208,10 @@ class DatabricksBackend:
 
         def _sync() -> None:
             try:
-                self.workspace_client().vector_search_indexes.sync_index(
-                    index_name=self.config.vs_index_name,
-                )
+                with redirect_stdout(sys.stderr):
+                    self.workspace_client().vector_search_indexes.sync_index(
+                        index_name=self.config.vs_index_name,
+                    )
                 logger.info("VS index sync triggered for %s.", self.config.vs_index_name)
             except Exception as exc:
                 logger.warning("VS index sync failed (non-fatal): %s", exc)
