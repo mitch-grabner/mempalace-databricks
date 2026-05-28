@@ -12,7 +12,7 @@ Enables queries like:
   "Find all rooms connected to riley-college-apps"
   "What topics bridge wing_hardware and wing_myproject?"
 
-No external graph DB needed — built from Delta table metadata via Spark SQL.
+No external graph DB needed — built from Delta table metadata via Databricks SQL.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from collections import Counter, defaultdict
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import DatabricksConfig
-from .palace import _get_spark
+from .databricks_backend import DatabricksBackend
 
 
 # ── Graph construction ────────────────────────────────────────────────────────
@@ -45,21 +45,16 @@ def build_graph(
     """
     config = config or DatabricksConfig()
 
-    try:
-        spark = _get_spark()
-    except RuntimeError:
-        return {}, []
-
     # Single aggregation query replaces the Python batch loop
     try:
-        rows = spark.sql(f"""
+        rows = DatabricksBackend(config).sql(f"""
             SELECT room, wing, hall, date, COUNT(*) AS cnt
             FROM {config.drawers_table}
             WHERE room IS NOT NULL
               AND room != 'general'
               AND wing IS NOT NULL
             GROUP BY room, wing, hall, date
-        """).collect()
+        """)
     except Exception:
         return {}, []
 
@@ -78,7 +73,7 @@ def build_graph(
             rd["halls"].add(row["hall"])
         if row["date"]:
             rd["dates"].add(row["date"])
-        rd["count"] += row["cnt"]
+        rd["count"] += int(row["cnt"])
 
     # Build edges from rooms that span multiple wings
     edges: List[Dict[str, Any]] = []

@@ -42,17 +42,16 @@ Tools (agent diary):
 """
 
 import hashlib
-import threading
 import time as _time
 import json
 import logging
-import os
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .config import DatabricksConfig, sanitize_content, sanitize_name
+from .databricks_backend import DatabricksBackend, sql_escape
 from .query_sanitizer import sanitize_query
 from .version import __version__
 
@@ -63,73 +62,45 @@ logger = logging.getLogger("mempalace_mcp")
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 _config = DatabricksConfig()
+_backend: Optional[DatabricksBackend] = None
 
 
 # ── Lazy SDK clients ──────────────────────────────────────────────────────────
 
-_ws_client = None
-_vs_client = None
-_vs_client_created_at: float = 0.0
-_VS_TOKEN_TTL_SECONDS: float = 45 * 60  # Refresh token every 45 min (tokens expire ~1hr)
+def _get_backend() -> DatabricksBackend:
+    """Return a cached backend for the current module config.
 
-
-def _get_ws() -> "WorkspaceClient":
-    """Return a cached ``WorkspaceClient`` (auto-auth from env / app identity)."""
-    global _ws_client
-    if _ws_client is None:
-        from databricks.sdk import WorkspaceClient
-        _ws_client = WorkspaceClient()
-    return _ws_client
-
-
-def _build_vsc() -> "VectorSearchClient":
-    """Create a fresh ``VectorSearchClient`` with a current bearer token."""
-    from databricks.vector_search.client import VectorSearchClient
-
-    ws = _get_ws()
-    header_factory = ws.config.authenticate()
-    headers = header_factory() if callable(header_factory) else header_factory
-    token = (headers.get("Authorization") or "").removeprefix("Bearer ")
-    return VectorSearchClient(
-        workspace_url=ws.config.host,
-        personal_access_token=token,
-        disable_notice=True,
-    )
-
+    Tests monkeypatch ``_config`` directly, so recreate the backend when the
+    config object changes.
+    """
+    global _backend
+    if _backend is None or _backend.config is not _config:
+        _backend = DatabricksBackend(_config)
+    return _backend
 
 def _invalidate_vsc() -> None:
     """Force the next ``_get_vsc()`` call to create a fresh client."""
-    global _vs_client, _vs_client_created_at
-    _vs_client = None
-    _vs_client_created_at = 0.0
-    logger.info("VS client invalidated — will refresh on next call.")
+    _get_backend().invalidate_vector_search_client()
 
 
-def _get_vsc() -> "VectorSearchClient":
+def _get_ws():
+    """Return the cached WorkspaceClient."""
+    return _get_backend().workspace_client()
+
+
+def _get_vsc():
     """Return a ``VectorSearchClient``, refreshing when the token is stale.
 
     The client is cached for ``_VS_TOKEN_TTL_SECONDS`` (default 45 min).
     After that window the bearer token extracted from the WorkspaceClient
     is re-fetched, because Databricks App SP tokens expire after ~1 hour.
     """
-    global _vs_client, _vs_client_created_at
-    now = _time.monotonic()
-    if _vs_client is None or (now - _vs_client_created_at) > _VS_TOKEN_TTL_SECONDS:
-        _vs_client = _build_vsc()
-        _vs_client_created_at = now
-        logger.info("VS client (re)created with fresh token.")
-    return _vs_client
+    return _get_backend().vector_search_client()
 
 
 def _warehouse_id() -> str:
     """Resolve the SQL warehouse ID from environment."""
-    wid = os.environ.get("MEMPALACE_WAREHOUSE_ID", "")
-    if not wid:
-        raise RuntimeError(
-            "MEMPALACE_WAREHOUSE_ID env var is required. "
-            "Set it in app.yaml or export it before running."
-        )
-    return wid
+    return _get_backend().warehouse_id()
 
 
 # ── SQL & VS helpers ──────────────────────────────────────────────────────────
@@ -142,32 +113,12 @@ def _sql(query: str) -> List[Dict[str, Optional[str]]]:
         List of row dicts.  All values are strings (or None) because the
         Statement API serialises every column as text.
     """
-    from databricks.sdk.service.sql import StatementState
-
-    _t0 = _time.perf_counter()
-    resp = _get_ws().statement_execution.execute_statement(
-        warehouse_id=_warehouse_id(),
-        statement=query,
-        wait_timeout="30s",
-    )
-    _elapsed = (_time.perf_counter() - _t0) * 1000
-    logger.info("SQL %.0fms: %s", _elapsed, query[:80].replace(chr(10), " "))
-    if resp.status and resp.status.state == StatementState.FAILED:
-        msg = resp.status.error.message if resp.status.error else "Unknown SQL error"
-        raise RuntimeError(f"SQL failed: {msg}")
-
-    if not resp.manifest or not resp.result or not resp.result.data_array:
-        return []
-
-    columns = [c.name for c in resp.manifest.schema.columns]
-    return [dict(zip(columns, row)) for row in resp.result.data_array]
+    return _get_backend().sql(query)
 
 
 def _esc(value: str) -> str:
     """Escape single quotes for SQL string interpolation."""
-    if value is None:
-        return ""
-    return str(value).replace("'", "\\'")
+    return sql_escape(value)
 
 
 def _entity_id(name: str) -> str:
@@ -189,24 +140,16 @@ def _vs_search(
     _t0 = _time.perf_counter()
     for attempt in range(2):
         try:
-            index = _get_vsc().get_index(
-                endpoint_name=_config.vs_endpoint,
-                index_name=_config.vs_index_name,
-            )
-            resp = index.similarity_search(
+            resp_rows = _get_backend().vector_search(
                 query_text=query_text,
                 columns=columns,
                 num_results=num_results,
                 filters=filters,
                 query_type="hybrid",
             )
-            col_names = [c["name"] for c in resp.get("manifest", {}).get("columns", [])]
-            rows: List[Dict[str, Any]] = []
-            for row in resp.get("result", {}).get("data_array", []):
-                rows.append(dict(zip(col_names, row)))
             _elapsed = (_time.perf_counter() - _t0) * 1000
-            logger.info("VS search %.0fms: %d hits for '%s'", _elapsed, len(rows), query_text[:50])
-            return rows
+            logger.info("VS search %.0fms: %d hits for '%s'", _elapsed, len(resp_rows), query_text[:50])
+            return resp_rows
         except Exception as exc:
             err_str = str(exc).lower()
             if attempt == 0 and ("token" in err_str or "401" in err_str or "auth" in err_str):
@@ -226,29 +169,10 @@ def _wal_log(operation: str, params: dict, result: Optional[dict] = None) -> Non
     Runs in a daemon thread to avoid blocking tool handlers.
     WAL failures are logged but never propagate to the caller.
     """
-    def _write():
-        now = datetime.now(timezone.utc).isoformat()
-        try:
-            _sql(f"""
-                INSERT INTO {_config.wal_table}
-                (timestamp, operation, params, result, caller)
-                VALUES ('{now}', '{_esc(operation)}',
-                        '{_esc(json.dumps(params, default=str))}',
-                        '{_esc(json.dumps(result, default=str) if result else "")}',
-                        current_user())
-            """)
-        except Exception as exc:
-            logger.error("WAL write failed: %s", exc)
-
-    threading.Thread(target=_write, daemon=True).start()
+    _get_backend().wal_log(operation, params, result)
 
 
 # ── Vector Search Index Sync ──────────────────────────────────────────────────
-
-_vs_sync_lock = threading.Lock()
-_vs_last_sync: float = 0.0
-_VS_SYNC_DEBOUNCE_SECONDS: float = 60.0  # Min interval between sync triggers
-
 
 def _trigger_vs_sync() -> None:
     """Trigger a Vector Search index sync after a drawer write/delete.
@@ -257,24 +181,7 @@ def _trigger_vs_sync() -> None:
     Runs in a daemon thread to avoid blocking tool handlers.
     Sync failures are logged but never propagate to the caller.
     """
-    global _vs_last_sync
-    with _vs_sync_lock:
-        now = _time.monotonic()
-        if (now - _vs_last_sync) < _VS_SYNC_DEBOUNCE_SECONDS:
-            logger.debug("VS sync debounced (last sync %.0fs ago).", now - _vs_last_sync)
-            return
-        _vs_last_sync = now
-
-    def _sync():
-        try:
-            _get_ws().vector_search_indexes.sync_index(
-                index_name=_config.vs_index_name,
-            )
-            logger.info("VS index sync triggered for %s.", _config.vs_index_name)
-        except Exception as exc:
-            logger.warning("VS index sync failed (non-fatal): %s", exc)
-
-    threading.Thread(target=_sync, daemon=True).start()
+    _get_backend().trigger_vector_sync()
 
 
 def _no_palace() -> dict:

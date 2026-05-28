@@ -16,9 +16,9 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from .palace import (
     SKIP_DIRS,
-    _get_spark,
     add_drawers,
     file_already_mined,
+    get_backend,
     make_drawer_id,
 )
 from .config import DatabricksConfig
@@ -336,13 +336,9 @@ def process_file(
         return len(chunks), room
 
     # Purge stale drawers for this file before re-inserting fresh chunks.
-    # With Delta MERGE this is cleaner than the ChromaDB upsert workaround.
+    # With Delta MERGE this is cleaner than the old local upsert workaround.
     try:
-        spark = _get_spark()
-        safe_source = source_file.replace("'", "\\'")
-        spark.sql(
-            f"DELETE FROM {config.drawers_table} WHERE source_file = '{safe_source}'"
-        )
+        get_backend(config).delete_drawers_for_source(source_file)
     except Exception:
         pass  # table may not exist during first run
 
@@ -502,6 +498,8 @@ def mine(
         )
         if drawers == 0 and not dry_run:
             files_skipped += 1
+        elif drawers == 0:
+            continue
         else:
             total_drawers += drawers
             room_counts[room] += 1
@@ -527,22 +525,21 @@ def status(config: Optional[DatabricksConfig] = None) -> None:
     """Show what's been filed in the palace via Delta table query."""
     config = config or DatabricksConfig()
     try:
-        spark = _get_spark()
-        rows = spark.sql(f"""
+        rows = get_backend(config).sql(f"""
             SELECT wing, room, COUNT(*) AS cnt
             FROM {config.drawers_table}
             GROUP BY wing, room
             ORDER BY wing, cnt DESC
-        """).collect()
+        """)
     except Exception:
         print(f"\n  No palace found at {config.drawers_table}")
-        print("  Run the setup notebook, then mine data.")
+        print("  Verify MEMPALACE_WAREHOUSE_ID and Databricks auth, then retry.")
         return
 
-    total = sum(r["cnt"] for r in rows)
+    total = sum(int(r["cnt"]) for r in rows)
     wing_rooms: Dict[str, Dict[str, int]] = defaultdict(dict)
     for r in rows:
-        wing_rooms[r["wing"]][r["room"]] = r["cnt"]
+        wing_rooms[r["wing"]][r["room"]] = int(r["cnt"])
 
     print(f"\n{'=' * 55}")
     print(f"  MemPalace Status — {total} drawers")

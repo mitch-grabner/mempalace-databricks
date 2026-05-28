@@ -9,7 +9,7 @@ Real knowledge graph with:
   - Closet references (links back to the verbatim memory)
 
 Storage: Delta tables in Unity Catalog (scratch.mitch_grabner.mempalace_entities / _triples)
-Query: entity-first traversal with time filtering via Spark SQL
+Query: entity-first traversal with time filtering via Databricks SQL
 
 Usage::
 
@@ -31,7 +31,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from .config import DatabricksConfig
-from .palace import _get_spark
+from .databricks_backend import DatabricksBackend
 
 
 class KnowledgeGraph:
@@ -43,7 +43,7 @@ class KnowledgeGraph:
 
     def __init__(self, config: Optional[DatabricksConfig] = None) -> None:
         self._config = config or DatabricksConfig()
-        self._spark = _get_spark()
+        self._backend = DatabricksBackend(self._config)
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -54,7 +54,7 @@ class KnowledgeGraph:
 
     def _sql(self, query: str) -> List[Dict[str, Any]]:
         """Execute SQL and return a list of row dicts."""
-        return [row.asDict() for row in self._spark.sql(query).collect()]
+        return self._backend.sql(query)
 
     @staticmethod
     def _esc(value: str) -> str:
@@ -88,7 +88,7 @@ class KnowledgeGraph:
         ename = self._esc(name)
         table = self._config.entities_table
 
-        self._spark.sql(f"""
+        self._backend.sql(f"""
             MERGE INTO {table} AS target
             USING (SELECT
                 '{eid}' AS id,
@@ -144,7 +144,7 @@ class KnowledgeGraph:
         # Auto-create entities if missing
         for eid, ename in [(sub_id, subject), (obj_id, obj)]:
             safe_name = self._esc(ename)
-            self._spark.sql(f"""
+            self._backend.sql(f"""
                 MERGE INTO {entities_table} AS target
                 USING (SELECT '{eid}' AS id, '{safe_name}' AS name) AS source
                 ON target.id = source.id
@@ -175,7 +175,7 @@ class KnowledgeGraph:
         sc = f"'{self._esc(source_closet)}'" if source_closet else "NULL"
         sf = f"'{self._esc(source_file)}'" if source_file else "NULL"
 
-        self._spark.sql(f"""
+        self._backend.sql(f"""
             INSERT INTO {triples_table}
             (id, subject, predicate, object, valid_from, valid_to,
              confidence, source_closet, source_file, extracted_at)
@@ -207,7 +207,7 @@ class KnowledgeGraph:
         ended = ended or date.today().isoformat()
         table = self._config.triples_table
 
-        self._spark.sql(f"""
+        self._backend.sql(f"""
             UPDATE {table}
             SET valid_to = '{ended}'
             WHERE subject = '{sub_id}'
@@ -387,11 +387,11 @@ class KnowledgeGraph:
         et = self._config.entities_table
         tt = self._config.triples_table
 
-        entity_count = self._sql(f"SELECT COUNT(*) AS cnt FROM {et}")[0]["cnt"]
-        triple_count = self._sql(f"SELECT COUNT(*) AS cnt FROM {tt}")[0]["cnt"]
-        current_count = self._sql(
+        entity_count = int(self._sql(f"SELECT COUNT(*) AS cnt FROM {et}")[0]["cnt"])
+        triple_count = int(self._sql(f"SELECT COUNT(*) AS cnt FROM {tt}")[0]["cnt"])
+        current_count = int(self._sql(
             f"SELECT COUNT(*) AS cnt FROM {tt} WHERE valid_to IS NULL"
-        )[0]["cnt"]
+        )[0]["cnt"])
         predicates = [
             r["predicate"]
             for r in self._sql(

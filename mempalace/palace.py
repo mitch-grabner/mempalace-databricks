@@ -1,20 +1,12 @@
-"""
-palace.py — Shared palace operations (Databricks-native).
-
-Consolidates Delta table access patterns used by both miners and the MCP server.
-Replaces the original ChromaDB-backed implementation.
-"""
+"""palace.py — Shared palace operations (Databricks-native)."""
 
 from __future__ import annotations
 
 import hashlib
-import os
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from pyspark.sql import DataFrame, Row, SparkSession
-
 from .config import DatabricksConfig
+from .databricks_backend import DatabricksBackend
 
 # ── Directory skip-list (backend-agnostic) ────────────────────────────────────
 # Used by miners when walking a project tree.  Unchanged from upstream.
@@ -46,23 +38,21 @@ SKIP_DIRS = {
 }
 
 
-# ── Spark helpers ─────────────────────────────────────────────────────────────
+# ── Backend helpers ───────────────────────────────────────────────────────────
 
 
-def _get_spark() -> SparkSession:
-    """Return the active SparkSession.
+def get_backend(config: Optional[DatabricksConfig] = None) -> DatabricksBackend:
+    """Return a new Databricks backend for the provided config."""
+    return DatabricksBackend(config or DatabricksConfig())
 
-    Raises:
-        RuntimeError: If no active SparkSession is found (i.e. running
-            outside a Databricks notebook / job context).
+
+def _get_spark():
+    """Compatibility stub for old imports.
+
+    The default backend no longer uses Spark. Code paths that still call this
+    need to be rewired to ``DatabricksBackend``.
     """
-    session = SparkSession.getActiveSession()
-    if session is None:
-        raise RuntimeError(
-            "No active SparkSession. MemPalace-Databricks requires a "
-            "notebook or job execution context."
-        )
-    return session
+    raise RuntimeError("Spark is not used by local MemPalace Databricks storage.")
 
 
 # ── Drawer ID generation ─────────────────────────────────────────────────────
@@ -92,22 +82,10 @@ def make_drawer_id(
 # ── Palace table operations ───────────────────────────────────────────────────
 
 
-def get_drawers_df(config: Optional[DatabricksConfig] = None) -> DataFrame:
-    """Return the drawers Delta table as a Spark DataFrame.
-
-    Args:
-        config: Databricks configuration.  Uses defaults if not provided.
-
-    Returns:
-        A Spark DataFrame pointing at the ``mempalace_drawers`` table.
-
-    Raises:
-        RuntimeError: If no active SparkSession exists.
-        AnalysisException: If the table does not exist (run setup notebook first).
-    """
+def get_drawers_df(config: Optional[DatabricksConfig] = None) -> List[Dict[str, Any]]:
+    """Return recent drawer rows as dictionaries."""
     config = config or DatabricksConfig()
-    spark = _get_spark()
-    return spark.table(config.drawers_table)
+    return get_backend(config).sql(f"SELECT * FROM {config.drawers_table} LIMIT 1000")
 
 
 def file_already_mined(
@@ -131,29 +109,7 @@ def file_already_mined(
         True if the file is already present (and up-to-date when
         ``check_mtime`` is set), False otherwise.
     """
-    spark = _get_spark()
-    try:
-        # Parameterised via f-string with escaped single quotes — source_file
-        # comes from os.walk, not user input, but we still escape defensively.
-        safe_source = source_file.replace("'", "\\'")
-        rows = spark.sql(
-            f"SELECT source_mtime FROM {config.drawers_table} "
-            f"WHERE source_file = '{safe_source}' LIMIT 1"
-        ).collect()
-
-        if not rows:
-            return False
-
-        if check_mtime:
-            stored_mtime = rows[0]["source_mtime"]
-            if stored_mtime is None:
-                return False
-            current_mtime = os.path.getmtime(source_file)
-            return float(stored_mtime) == current_mtime
-
-        return True
-    except Exception:  # table may not exist yet during first run
-        return False
+    return get_backend(config).file_already_mined(source_file, check_mtime=check_mtime)
 
 
 def add_drawers(
@@ -179,37 +135,7 @@ def add_drawers(
     if not drawers:
         return 0
 
-    spark = _get_spark()
-    now = datetime.now(timezone.utc).isoformat()
-
-    rows = []
-    for d in drawers:
-        rows.append(Row(
-            id=d["id"],
-            text=d["text"],
-            wing=d["wing"],
-            room=d["room"],
-            hall=d.get("hall"),
-            source_file=d.get("source_file"),
-            source_mtime=d.get("source_mtime"),
-            chunk_index=d.get("chunk_index"),
-            date=d.get("date"),
-            importance=float(d.get("importance", 3.0)),
-            agent=d.get("agent", "mempalace"),
-            filed_at=now,
-        ))
-
-    df = spark.createDataFrame(rows)
-    df.createOrReplaceTempView("_mempalace_new_drawers")
-
-    spark.sql(f"""
-        MERGE INTO {config.drawers_table} AS target
-        USING _mempalace_new_drawers AS source
-        ON target.id = source.id
-        WHEN NOT MATCHED THEN INSERT *
-    """)
-
-    return len(rows)
+    return get_backend(config).add_drawers(drawers)
 
 
 def delete_drawer(config: DatabricksConfig, drawer_id: str) -> bool:
@@ -222,13 +148,5 @@ def delete_drawer(config: DatabricksConfig, drawer_id: str) -> bool:
     Returns:
         True if a row was deleted, False if the ID was not found.
     """
-    spark = _get_spark()
-    safe_id = drawer_id.replace("'", "\\'")
-    result = spark.sql(
-        f"DELETE FROM {config.drawers_table} WHERE id = '{safe_id}'"
-    )
-    # Delta DELETE returns a DataFrame with 'num_affected_rows'
-    affected = result.collect()
-    if affected and hasattr(affected[0], "num_affected_rows"):
-        return affected[0]["num_affected_rows"] > 0
-    return True  # assume success if we can't determine count
+    get_backend(config).delete_drawer(drawer_id)
+    return True

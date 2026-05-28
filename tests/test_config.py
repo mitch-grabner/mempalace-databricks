@@ -4,8 +4,6 @@ test_config.py — Tests for DatabricksConfig, sanitize_name, sanitize_content.
 All pure-Python tests — no Spark, no network calls.
 """
 
-import os
-
 import pytest
 
 from mempalace.config import (
@@ -39,15 +37,21 @@ class TestDatabricksConfig:
         monkeypatch.setenv("MEMPALACE_CATALOG", "env_cat")
         monkeypatch.setenv("MEMPALACE_SCHEMA", "env_sch")
         monkeypatch.setenv("MEMPALACE_VS_ENDPOINT", "env_ep")
+        monkeypatch.setenv("MEMPALACE_WAREHOUSE_ID", "wh1")
+        monkeypatch.setenv("MEMPALACE_DATABRICKS_PROFILE", "prof1")
         cfg = DatabricksConfig()
         assert cfg.catalog == "env_cat"
         assert cfg.schema == "env_sch"
         assert cfg.vs_endpoint == "env_ep"
+        assert cfg.warehouse_id == "wh1"
+        assert cfg.databricks_profile == "prof1"
 
     def test_explicit_beats_env(self, monkeypatch):
         monkeypatch.setenv("MEMPALACE_CATALOG", "env_cat")
-        cfg = DatabricksConfig(catalog="explicit")
+        monkeypatch.setenv("MEMPALACE_WAREHOUSE_ID", "env_wh")
+        cfg = DatabricksConfig(catalog="explicit", warehouse_id="explicit_wh")
         assert cfg.catalog == "explicit"
+        assert cfg.warehouse_id == "explicit_wh"
 
     def test_drawers_table(self):
         cfg = DatabricksConfig(catalog="c", schema="s")

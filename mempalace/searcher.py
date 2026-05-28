@@ -12,9 +12,8 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from databricks.vector_search.client import VectorSearchClient
-
 from .config import DatabricksConfig
+from .databricks_backend import DatabricksBackend
 
 logger = logging.getLogger("mempalace_mcp")
 
@@ -81,18 +80,14 @@ def _query_vs_index(
         SearchError: If the index cannot be reached or the query fails.
     """
     try:
-        vsc = VectorSearchClient()
-        index = vsc.get_index(
-            endpoint_name=config.vs_endpoint,
-            index_name=config.vs_index_name,
-        )
+        backend = DatabricksBackend(config)
     except Exception as e:
         raise SearchError(f"Cannot reach VS index {config.vs_index_name}: {e}") from e
 
     filters = _build_vs_filters(wing, room)
 
     try:
-        results = index.similarity_search(
+        data_array = backend.vector_search(
             query_text=query,
             columns=_VS_COLUMNS,
             num_results=n_results,
@@ -102,12 +97,8 @@ def _query_vs_index(
     except Exception as e:
         raise SearchError(f"Vector Search query failed: {e}") from e
 
-    column_names = results.get("result", {}).get("column_names", [])
-    data_array = results.get("result", {}).get("data_array", [])
-
     hits: List[Dict[str, Any]] = []
-    for row in data_array:
-        row_dict = dict(zip(column_names, row))
+    for row_dict in data_array:
         hits.append({
             "text": row_dict.get("text", ""),
             "wing": row_dict.get("wing", "unknown"),

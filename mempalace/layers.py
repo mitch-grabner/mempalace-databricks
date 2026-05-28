@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .config import DatabricksConfig
-from .palace import _get_spark
+from .databricks_backend import DatabricksBackend, sql_escape
 from .searcher import _query_vs_index, SearchError
 
 
@@ -81,6 +81,7 @@ class Layer1:
         wing: Optional[str] = None,
     ) -> None:
         self._config = config or DatabricksConfig()
+        self._backend = DatabricksBackend(self._config)
         self.wing = wing
 
     def generate(self) -> str:
@@ -89,15 +90,10 @@ class Layer1:
         Returns:
             A multi-line string suitable for injection into a system prompt.
         """
-        try:
-            spark = _get_spark()
-        except RuntimeError:
-            return "## L1 — No Spark session. Run from a notebook or job."
-
         table = self._config.drawers_table
 
         # Build query — importance DESC, recent first as tiebreaker
-        where = f"WHERE wing = '{self.wing}'" if self.wing else ""
+        where = f"WHERE wing = '{sql_escape(self.wing)}'" if self.wing else ""
         query = f"""
             SELECT text, wing, room, source_file, importance
             FROM {table}
@@ -107,9 +103,9 @@ class Layer1:
         """
 
         try:
-            rows = spark.sql(query).collect()
+            rows = self._backend.sql(query)
         except Exception:
-            return "## L1 — No palace found. Run the setup notebook, then mine data."
+            return "## L1 — No palace found. Verify Databricks auth and MEMPALACE_WAREHOUSE_ID."
 
         if not rows:
             return "## L1 — No memories yet."
@@ -163,6 +159,7 @@ class Layer2:
 
     def __init__(self, config: Optional[DatabricksConfig] = None) -> None:
         self._config = config or DatabricksConfig()
+        self._backend = DatabricksBackend(self._config)
 
     def retrieve(
         self,
@@ -180,19 +177,14 @@ class Layer2:
         Returns:
             Formatted multi-line string of drawer snippets.
         """
-        try:
-            spark = _get_spark()
-        except RuntimeError:
-            return "No Spark session available."
-
         table = self._config.drawers_table
 
         # Build WHERE clause
         conditions: List[str] = []
         if wing:
-            conditions.append(f"wing = '{wing}'")
+            conditions.append(f"wing = '{sql_escape(wing)}'")
         if room:
-            conditions.append(f"room = '{room}'")
+            conditions.append(f"room = '{sql_escape(room)}'")
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
         query = f"""
@@ -204,7 +196,7 @@ class Layer2:
         """
 
         try:
-            rows = spark.sql(query).collect()
+            rows = self._backend.sql(query)
         except Exception as e:
             return f"Retrieval error: {e}"
 
@@ -394,11 +386,10 @@ class MemoryStack:
 
         # Count drawers
         try:
-            spark = _get_spark()
-            count_row = spark.sql(
+            count_row = DatabricksBackend(config).sql(
                 f"SELECT COUNT(*) AS cnt FROM {config.drawers_table}"
-            ).collect()[0]
-            result["total_drawers"] = count_row["cnt"]
+            )[0]
+            result["total_drawers"] = int(count_row["cnt"])
         except Exception:
             result["total_drawers"] = 0
 

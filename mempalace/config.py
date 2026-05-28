@@ -1,12 +1,17 @@
 """
 MemPalace configuration system — Databricks-native.
 
-Priority: env vars (MEMPALACE_CATALOG, MEMPALACE_SCHEMA) > defaults.
+Priority: env vars (MEMPALACE_CATALOG, MEMPALACE_SCHEMA, etc.) > defaults.
 
 All storage is resolved from a (catalog, schema) pair:
   - Delta tables:  {catalog}.{schema}.mempalace_drawers, _entities, _triples, ...
   - Vector Search: {catalog}.{schema}.mempalace_drawers_index
   - Config Volume: /Volumes/{catalog}/{schema}/mempalace_config/
+
+Local auth uses the Databricks SDK:
+  - MEMPALACE_DATABRICKS_PROFILE selects a ~/.databrickscfg profile when set.
+  - Otherwise the SDK auto-detects DATABRICKS_HOST/TOKEN, app auth, or defaults.
+  - MEMPALACE_WAREHOUSE_ID is required for SQL Statement Execution.
 """
 
 import json
@@ -140,7 +145,9 @@ class DatabricksConfig:
     Args:
         catalog: Unity Catalog catalog name.
         schema: Unity Catalog schema name.
-        vs_endpoint: Name of the Vector Search endpoint to use.
+    vs_endpoint: Name of the Vector Search endpoint to use.
+    warehouse_id: SQL warehouse ID for Statement Execution API calls.
+    databricks_profile: Optional Databricks SDK profile name.
         topic_wings: Default topic wing names for onboarding.
         hall_keywords: Mapping of hall names to keyword lists.
     """
@@ -148,6 +155,8 @@ class DatabricksConfig:
     catalog: str = ""       # Resolved in __post_init__
     schema: str = ""        # Resolved in __post_init__
     vs_endpoint: str = ""   # Resolved in __post_init__
+    warehouse_id: str = ""  # Resolved in __post_init__
+    databricks_profile: str = ""  # Resolved in __post_init__
     topic_wings: List[str] = field(default_factory=lambda: list(DEFAULT_TOPIC_WINGS))
     hall_keywords: Dict[str, List[str]] = field(
         default_factory=lambda: dict(DEFAULT_HALL_KEYWORDS),
@@ -167,6 +176,16 @@ class DatabricksConfig:
         object.__setattr__(
             self, "vs_endpoint",
             self.vs_endpoint or _env_or("MEMPALACE_VS_ENDPOINT", DEFAULT_VS_ENDPOINT),
+        )
+        object.__setattr__(
+            self,
+            "warehouse_id",
+            self.warehouse_id or _env_or("MEMPALACE_WAREHOUSE_ID", ""),
+        )
+        object.__setattr__(
+            self,
+            "databricks_profile",
+            self.databricks_profile or _env_or("MEMPALACE_DATABRICKS_PROFILE", ""),
         )
 
     # ── Derived table / index names ───────────────────────────────────────

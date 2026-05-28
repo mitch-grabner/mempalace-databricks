@@ -10,9 +10,7 @@ Same palace as project mining. Different ingest strategy.
 
 import os
 import sys
-import hashlib
 from pathlib import Path
-from datetime import datetime, timezone
 from collections import Counter, defaultdict
 from typing import Dict, List, Optional
 

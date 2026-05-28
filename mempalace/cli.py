@@ -27,13 +27,22 @@ Examples:
     mempalace search "pricing discussion" --wing my_app --room costs
 """
 
-import os
 import sys
-import shlex
 import argparse
-from pathlib import Path
 
-from .config import MempalaceConfig
+from .config import DatabricksConfig
+
+
+def _warn_palace_ignored(args) -> None:
+    """Warn when legacy --palace is supplied."""
+    if getattr(args, "palace", None):
+        print("Warning: --palace is deprecated and ignored; storage is Databricks-backed.", file=sys.stderr)
+
+
+def _config_from_args(args) -> DatabricksConfig:
+    """Build runtime config for CLI commands."""
+    _warn_palace_ignored(args)
+    return DatabricksConfig()
 
 
 def cmd_init(args):
@@ -62,11 +71,11 @@ def cmd_init(args):
 
     # Pass 2: detect rooms from folder structure
     detect_rooms_local(project_dir=args.dir, yes=getattr(args, "yes", False))
-    MempalaceConfig().init()
+    print("\n  MemPalace project config initialized. Storage target is Databricks.")
 
 
 def cmd_mine(args):
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    config = _config_from_args(args)
     include_ignored = []
     for raw in args.include_ignored or []:
         include_ignored.extend(part.strip() for part in raw.split(",") if part.strip())
@@ -76,7 +85,7 @@ def cmd_mine(args):
 
         mine_convos(
             convo_dir=args.dir,
-            palace_path=palace_path,
+            config=config,
             wing=args.wing,
             agent=args.agent,
             limit=args.limit,
@@ -88,7 +97,7 @@ def cmd_mine(args):
 
         mine(
             project_dir=args.dir,
-            palace_path=palace_path,
+            config=config,
             wing_override=args.wing,
             agent=args.agent,
             limit=args.limit,
@@ -101,11 +110,11 @@ def cmd_mine(args):
 def cmd_search(args):
     from .searcher import search, SearchError
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+    config = _config_from_args(args)
     try:
         search(
             query=args.query,
-            palace_path=palace_path,
+            config=config,
             wing=args.wing,
             room=args.room,
             n_results=args.results,
@@ -118,8 +127,7 @@ def cmd_wakeup(args):
     """Show L0 (identity) + L1 (essential story) — the wake-up context."""
     from .layers import MemoryStack
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    stack = MemoryStack(palace_path=palace_path)
+    stack = MemoryStack(config=_config_from_args(args))
 
     text = stack.wake_up(wing=args.wing)
     tokens = len(text) // 4
@@ -152,89 +160,22 @@ def cmd_split(args):
 
 def cmd_migrate(args):
     """Migrate palace from a different ChromaDB version."""
-    from .migrate import migrate
-
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    migrate(palace_path=palace_path, dry_run=args.dry_run)
+    _warn_palace_ignored(args)
+    print("Legacy ChromaDB migration is unsupported in the Databricks storage branch.")
+    print("Use the existing Unity Catalog tables and Vector Search index instead.")
 
 
 def cmd_status(args):
     from .miner import status
 
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-    status(palace_path=palace_path)
+    status(config=_config_from_args(args))
 
 
 def cmd_repair(args):
     """Rebuild palace vector index from SQLite metadata."""
-    import chromadb
-    import shutil
-
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-
-    if not os.path.isdir(palace_path):
-        print(f"\n  No palace found at {palace_path}")
-        return
-
-    print(f"\n{'=' * 55}")
-    print("  MemPalace Repair")
-    print(f"{'=' * 55}\n")
-    print(f"  Palace: {palace_path}")
-
-    # Try to read existing drawers
-    try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
-        total = col.count()
-        print(f"  Drawers found: {total}")
-    except Exception as e:
-        print(f"  Error reading palace: {e}")
-        print("  Cannot recover — palace may need to be re-mined from source files.")
-        return
-
-    if total == 0:
-        print("  Nothing to repair.")
-        return
-
-    # Extract all drawers in batches
-    print("\n  Extracting drawers...")
-    batch_size = 5000
-    all_ids = []
-    all_docs = []
-    all_metas = []
-    offset = 0
-    while offset < total:
-        batch = col.get(limit=batch_size, offset=offset, include=["documents", "metadatas"])
-        all_ids.extend(batch["ids"])
-        all_docs.extend(batch["documents"])
-        all_metas.extend(batch["metadatas"])
-        offset += batch_size
-    print(f"  Extracted {len(all_ids)} drawers")
-
-    # Backup and rebuild
-    palace_path = palace_path.rstrip(os.sep)
-    backup_path = palace_path + ".backup"
-    if os.path.exists(backup_path):
-        shutil.rmtree(backup_path)
-    print(f"  Backing up to {backup_path}...")
-    shutil.copytree(palace_path, backup_path)
-
-    print("  Rebuilding collection...")
-    client.delete_collection("mempalace_drawers")
-    new_col = client.create_collection("mempalace_drawers")
-
-    filed = 0
-    for i in range(0, len(all_ids), batch_size):
-        batch_ids = all_ids[i : i + batch_size]
-        batch_docs = all_docs[i : i + batch_size]
-        batch_metas = all_metas[i : i + batch_size]
-        new_col.add(documents=batch_docs, ids=batch_ids, metadatas=batch_metas)
-        filed += len(batch_ids)
-        print(f"  Re-filed {filed}/{len(all_ids)} drawers...")
-
-    print(f"\n  Repair complete. {filed} drawers rebuilt.")
-    print(f"  Backup saved at {backup_path}")
-    print(f"\n{'=' * 55}\n")
+    _warn_palace_ignored(args)
+    print("Legacy ChromaDB repair is unsupported in the Databricks storage branch.")
+    print("To refresh search, trigger sync on the Databricks Vector Search index.")
 
 
 def cmd_hook(args):
@@ -254,143 +195,23 @@ def cmd_instructions(args):
 def cmd_mcp(args):
     """Show how to wire MemPalace into MCP-capable hosts."""
     base_server_cmd = "python -m mempalace.mcp_server"
-
-    if args.palace:
-        resolved_palace = str(Path(args.palace).expanduser())
-        server_cmd = f"{base_server_cmd} --palace {shlex.quote(resolved_palace)}"
-    else:
-        server_cmd = base_server_cmd
+    _warn_palace_ignored(args)
+    server_cmd = base_server_cmd
 
     print("MemPalace MCP quick setup:")
     print(f"  claude mcp add mempalace -- {server_cmd}")
+    print("\nRequired local env:")
+    print("  export MEMPALACE_WAREHOUSE_ID=<sql-warehouse-id>")
+    print("  export MEMPALACE_DATABRICKS_PROFILE=qorvo-dna01  # optional")
     print("\nRun the server directly:")
     print(f"  {server_cmd}")
-
-    if not args.palace:
-        print("\nOptional custom palace:")
-        print(f"  claude mcp add mempalace -- {base_server_cmd} --palace /path/to/palace")
-        print(f"  {base_server_cmd} --palace /path/to/palace")
 
 
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
-    import chromadb
-    from .dialect import Dialect
-
-    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
-
-    # Load dialect (with optional entity config)
-    config_path = args.config
-    if not config_path:
-        for candidate in ["entities.json", os.path.join(palace_path, "entities.json")]:
-            if os.path.exists(candidate):
-                config_path = candidate
-                break
-
-    if config_path and os.path.exists(config_path):
-        dialect = Dialect.from_config(config_path)
-        print(f"  Loaded entity config: {config_path}")
-    else:
-        dialect = Dialect()
-
-    # Connect to palace
-    try:
-        client = chromadb.PersistentClient(path=palace_path)
-        col = client.get_collection("mempalace_drawers")
-    except Exception:
-        print(f"\n  No palace found at {palace_path}")
-        print("  Run: mempalace init <dir> then mempalace mine <dir>")
-        sys.exit(1)
-
-    # Query drawers in batches to avoid SQLite variable limit (~999)
-    where = {"wing": args.wing} if args.wing else None
-    _BATCH = 500
-    docs, metas, ids = [], [], []
-    offset = 0
-    while True:
-        try:
-            kwargs = {"include": ["documents", "metadatas"], "limit": _BATCH, "offset": offset}
-            if where:
-                kwargs["where"] = where
-            batch = col.get(**kwargs)
-        except Exception as e:
-            if not docs:
-                print(f"\n  Error reading drawers: {e}")
-                sys.exit(1)
-            break
-        batch_docs = batch.get("documents", [])
-        if not batch_docs:
-            break
-        docs.extend(batch_docs)
-        metas.extend(batch.get("metadatas", []))
-        ids.extend(batch.get("ids", []))
-        offset += len(batch_docs)
-        if len(batch_docs) < _BATCH:
-            break
-
-    if not docs:
-        wing_label = f" in wing '{args.wing}'" if args.wing else ""
-        print(f"\n  No drawers found{wing_label}.")
-        return
-
-    print(
-        f"\n  Compressing {len(docs)} drawers"
-        + (f" in wing '{args.wing}'" if args.wing else "")
-        + "..."
-    )
-    print()
-
-    total_original = 0
-    total_compressed = 0
-    compressed_entries = []
-
-    for doc, meta, doc_id in zip(docs, metas, ids):
-        compressed = dialect.compress(doc, metadata=meta)
-        stats = dialect.compression_stats(doc, compressed)
-
-        total_original += stats["original_chars"]
-        total_compressed += stats["compressed_chars"]
-
-        compressed_entries.append((doc_id, compressed, meta, stats))
-
-        if args.dry_run:
-            wing_name = meta.get("wing", "?")
-            room_name = meta.get("room", "?")
-            source = Path(meta.get("source_file", "?")).name
-            print(f"  [{wing_name}/{room_name}] {source}")
-            print(
-                f"    {stats['original_tokens']}t -> {stats['compressed_tokens']}t ({stats['ratio']:.1f}x)"
-            )
-            print(f"    {compressed}")
-            print()
-
-    # Store compressed versions (unless dry-run)
-    if not args.dry_run:
-        try:
-            comp_col = client.get_or_create_collection("mempalace_compressed")
-            for doc_id, compressed, meta, stats in compressed_entries:
-                comp_meta = dict(meta)
-                comp_meta["compression_ratio"] = round(stats["ratio"], 1)
-                comp_meta["original_tokens"] = stats["original_tokens"]
-                comp_col.upsert(
-                    ids=[doc_id],
-                    documents=[compressed],
-                    metadatas=[comp_meta],
-                )
-            print(
-                f"  Stored {len(compressed_entries)} compressed drawers in 'mempalace_compressed' collection."
-            )
-        except Exception as e:
-            print(f"  Error storing compressed drawers: {e}")
-            sys.exit(1)
-
-    # Summary
-    ratio = total_original / max(total_compressed, 1)
-    orig_tokens = Dialect.count_tokens("x" * total_original)
-    comp_tokens = Dialect.count_tokens("x" * total_compressed)
-    print(f"  Total: {orig_tokens:,}t -> {comp_tokens:,}t ({ratio:.1f}x compression)")
-    if args.dry_run:
-        print("  (dry run -- nothing stored)")
+    _warn_palace_ignored(args)
+    print("Legacy ChromaDB compression is unsupported in the Databricks storage branch.")
+    print("AAAK compression can be reintroduced later as a Databricks-backed feature.")
 
 
 def main():
